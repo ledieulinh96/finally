@@ -1,59 +1,31 @@
 # Backend — Developer Guide
 
-## Project Setup
+## Setup and tests
 
 ```bash
 cd backend
-uv sync --extra dev   # Install all dependencies including test/lint tools
+uv sync --extra dev
+uv run --extra dev pytest -v --cov=app
+uv run --extra dev ruff check app/ tests/
 ```
 
-## Market Data API
+## Market data (`app/market/`)
 
-The market data subsystem lives in `app/market/`. Use these imports:
+Design: `planning/MARKET_DATA_INTERFACE.md` and `planning/MARKET_SIMULATOR.md`. Prices are integer KRW, tick-aligned, tickers are 6-char `str` codes.
 
 ```python
-from app.market import PriceCache, PriceUpdate, MarketDataSource, create_market_data_source
+from app.market import PriceCache, create_source, create_stream_router, NameRegistry, TickerTracker
+
+cache = PriceCache()
+source = create_source(cache)             # USE_YFINANCE=true -> YFinanceSource, else SimulatorSource
+await source.start({"005930", "000660"})  # cache is seeded before returning
+cache.price("005930")                     # int | None; trades must reject None
+app.include_router(create_stream_router(cache, NameRegistry().get))  # GET /api/stream/prices
+await source.stop()
 ```
 
-### Core Types
-
-- **`PriceUpdate`** — Immutable dataclass: `ticker`, `price`, `previous_price`, `timestamp`, plus properties `change`, `change_percent`, `direction` ("up"/"down"/"flat"), and `to_dict()` for JSON serialization.
-
-- **`PriceCache`** — Thread-safe in-memory store. Key methods:
-  - `update(ticker, price, timestamp=None) -> PriceUpdate`
-  - `get(ticker) -> PriceUpdate | None`
-  - `get_price(ticker) -> float | None`
-  - `get_all() -> dict[str, PriceUpdate]`
-  - `remove(ticker)`
-  - `version` property — monotonic counter, increments on every update (for SSE change detection)
-
-- **`MarketDataSource`** — Abstract interface implemented by `SimulatorDataSource` and `MassiveDataSource`. Lifecycle: `start(tickers)` -> `add_ticker()` / `remove_ticker()` -> `stop()`.
-
-- **`create_market_data_source(cache)`** — Factory. Returns `MassiveDataSource` if `MASSIVE_API_KEY` is set, otherwise `SimulatorDataSource`.
-
-### SSE Streaming
-
-```python
-from app.market import create_stream_router
-
-router = create_stream_router(price_cache)  # Returns FastAPI APIRouter
-# Endpoint: GET /api/stream/prices (text/event-stream)
-```
-
-### Seed Data
-
-Default tickers: AAPL, GOOGL, MSFT, AMZN, TSLA, NVDA, META, JPM, V, NFLX. Seed prices and per-ticker volatility/drift params are in `app/market/seed_prices.py`.
-
-## Running Tests
-
-```bash
-uv run --extra dev pytest -v              # All tests
-uv run --extra dev pytest --cov=app       # With coverage
-uv run --extra dev ruff check app/ tests/ # Lint
-```
-
-## Demo
-
-```bash
-uv run market_data_demo.py   # Live terminal dashboard with simulated prices
-```
+- `PriceQuote.to_event(name)` is the exact SSE payload from PLAN section 6; `cache.changed_since(version)` drives SSE deltas (`id:` = cache version, `Last-Event-ID` resumes).
+- `MarketDataSource` (base.py): `start/stop/add_ticker -> bool/remove_ticker/tickers/status`.
+- `SimulatorSource.step()` is public for deterministic tests (`seed=`). Env: `SIM_SEED`, `SIM_TIME_SCALE`, `SIM_EVENT_RATE`, `SIM_UPDATE_INTERVAL`.
+- `YFinanceSource` takes injectable `last_price_fn` / `batch_fn`; listing CSV is `backend/schema/krx_listing.csv` (decides `.KS` vs `.KQ`, else probes).
+- `TickerTracker.sync()` keeps tracked set = watchlist ∪ positions; `price_for_trade()` raises `PriceUnavailableError`.
