@@ -252,3 +252,51 @@ The following issues are most likely to cause implementation failures or agent-t
 8. **Single LLM mock fixture** — add a second fixture with a trade to enable E2E coverage of auto-execution.
 9. **`/api/chat` request/response schema** — define it explicitly in Section 8.
 10. **uvicorn worker count** — explicitly state `--workers 1` in the Dockerfile CMD.
+
+---
+
+## Resolution (2026-11-17)
+
+Every finding above is now either **implemented in code** (market data, `backend/app/market/`) or **decided in `PLAN.md`** for the agents who build the remaining platform.
+
+### Implemented in the market data backend (PR #5, `backend/app/market/`)
+
+| Finding | Resolution |
+|---|---|
+| SSE pushes stale prices 30× between yfinance polls | Sources write to the cache only on change. SSE sends only changed tickers (per-ticker events, `id` = cache version). A `: keepalive` comment goes out after 15 s idle. |
+| Empty cache on first SSE connect | Sources seed the cache on `start()` / `add_ticker()`. SSE sends a full snapshot on connect. |
+| yfinance unstable / rate-limited, no back-off | Batched polling in a worker thread, every exception caught, exponential back-off, `status == "degraded"` after repeated failures. NaN or missing symbols keep their last price. |
+| `.KS`/`.KQ` suffix guessing (Q1) | Bundled `backend/schema/krx_listing.csv` first, then a `.KS` → `.KQ` probe. |
+| `shortName` is Korean or terse; position name missing after watchlist removal | `NameRegistry` (in `listing.py`) is independent of the watchlist table. `TickerTracker` keeps held tickers priced (tracked = watchlist ∪ positions). |
+| Ticker validation unspecified | `^[0-9A-Z]{6}$` in `seed.py`. |
+| Trades when the cache has no price | The cache rejects non-int or non-positive prices. `TickerTracker.price_for_trade()` raises `PriceUnavailableError`, which maps to the "No price available" rejection. |
+| Missing SSE / thread-safety / conformance tests | Covered by `tests/market/` (90 tests). |
+
+**Still open for the backend agent** (decided in PLAN, not yet coded):
+- `main.py` / lifespan wiring and `GET /api/health`, including `market_session`, which needs a small KST session clock;
+- running with `--workers 1`;
+- OpenDART name lookup.
+
+### Decided in PLAN.md (for the remaining agents)
+
+| # | Finding | Decision (PLAN section) |
+|---|---|---|
+| 1 | `backend/db` vs `backend/schema` | `backend/schema/` everywhere (§4). The folder now holds `krx_listing.csv`. |
+| 2 | `POST /api/watchlist` `name` | Optional; the backend resolves it. Status codes 201, 409 (duplicate), 404 (unknown ticker) and 422 (§8). |
+| 3 | `GET /api/portfolio/history` write side-effect | GET is read-only. Snapshots are taken after each trade plus every 60 s in the background (§7). |
+| 4 | SQLite WAL | `journal_mode=WAL` and `busy_timeout=5000`. Each trade runs in one `BEGIN IMMEDIATE` transaction (§7). |
+| 5 | `session_open` in yfinance mode | First price seen; documented (§6). |
+| 6 | KRX market hours | `market_session` in health; "Market closed" badge (§6, §8). |
+| 7 | Q2 fractional shares | Whole shares only; validated as a positive int (§13). |
+| 8 | Single LLM mock fixture | A second "buy" fixture with a trade and a watchlist add, plus an E2E scenario (§9, §12). |
+| 9 | `/api/chat` schema | Request and response defined; `actions` JSON shape defined (§7, §8). |
+| 10 | uvicorn worker count | `--workers 1` (§3, §11). |
+| — | Indexes, `portfolio_state` PK, idempotent seeding | Added (§7). |
+| — | Error shape, duplicate/404 behaviour, trade validation, empty-cache fallback | "Validation & Error Conventions" (§8). |
+| — | Malformed LLM output, `name` omitted on add, history off-by-one, message length | §9 and §8. |
+| — | OpenDART scope (Q3) and trigger | Profile and key financials, keyword heuristic, 24 h cache (§9, §13). |
+| — | Playwright version, Compose only in `test/` | Pinned image; no top-level compose (§4, §12). |
+
+**Not adopted:**
+- *Remove OpenDART for v1*: kept, but optional and narrowly scoped (Q3).
+- *Drop `session_open` / the `name` column*: kept. PLAN's payload already depends on them, and they are now well-defined.
