@@ -1,49 +1,86 @@
-"""GBM market simulator: correlated sector moves, mean reversion, jumps, KRX ticks."""
+"""KRX market simulator — the default price source.
+
+Correlated GBM (market + sector factor model) with Poisson jump events, a weak
+Ornstein–Uhlenbeck pull toward the seed price, KRX tick snapping and the ±30%
+daily price limit. Design: planning/MARKET_SIMULATOR.md.
+
+Per step (Δt wall-clock seconds), for each ticker i, on log-price x_i::
+
+    dx = (μ − σ²/2)·Δτ + σ·√Δτ·(β_m·Z_m + β_s·Z_sector + β_e·ε_i)   # GBM, correlated
+         − κ·(x − x̄)·Δt                                          # mean reversion
+         + J                                                      # rare 2–5% jump
+
+    Δτ = Δt · time_scale / SECONDS_PER_TRADING_YEAR
+
+The internal price exp(x) stays a float; only the published price is snapped.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import math
+import random
 import time
+import zlib
+from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import numpy as np
 
-from .base import MarketDataSource
+from .base import MarketDataSource, SourceStatus
 from .cache import PriceCache
-from .seed import SeedParams, normalize_ticker, params_for
-from .ticks import snap_down, snap_to_tick, snap_up
+from .seed_data import DEFAULT_BETA_M, DEFAULT_SECTOR, DEFAULT_SIGMA, SEED_PARAMS
+from .ticks import PRICE_LIMIT, limit_band, normalize_ticker, snap_to_tick
 
 logger = logging.getLogger(__name__)
 
 SECONDS_PER_TRADING_YEAR = 252 * 6.5 * 3600  # 5,896,800
-LIMIT_PCT = 0.30
-STATIONARY_STD = 0.15
+STATIONARY_LOG_STD = 0.15  # OU band: ~±15% (1σ) around the seed price
+JUMP_MIN, JUMP_MAX = 0.02, 0.05
 CONTAGION_PROB = 0.3
-CONTAGION_SHARE = 0.4
+CONTAGION_FRACTION = 0.4
 
 
-@dataclass
+@dataclass(slots=True)
 class TickerState:
     ticker: str
     sector: str
     mu: float
     sigma: float
-    bm: float
-    bs: float
-    be: float
+    beta_m: float
+    beta_s: float
+    beta_e: float
     kappa: float
-    x: float  # log of internal float price
-    x_bar: float  # log of seed price
-    open_price: float  # seed price (session open)
-    lo: float  # price band in KRW (internal)
-    hi: float
-    pub_lo: int  # tick-aligned published band
-    pub_hi: int
+    x: float  # log of the internal (unsnapped) price
+    x_bar: float  # log of the seed price — the OU anchor
+    session_open: int
+    lower: int  # daily limit band, tick-aligned
+    upper: int
+
+    @property
+    def internal_price(self) -> float:
+        return math.exp(self.x)
+
+
+def stable_seed_price(ticker: str) -> int:
+    """Deterministic pseudo-price (~₩5,000–₩500,000) for an unknown ticker.
+
+    Uses crc32, not Python's salted hash(), so it is stable across restarts.
+    """
+    rng = random.Random(zlib.crc32(ticker.encode("ascii")))
+    return snap_to_tick(10 ** rng.uniform(3.7, 5.7))
 
 
 class SimulatorSource(MarketDataSource):
+    """MarketDataSource backed by the in-process KRX simulator.
+
+    ``step()`` is public and synchronous so tests can drive it without asyncio.
+    """
+
+    name = "simulator"
+
     def __init__(
         self,
         cache: PriceCache,
@@ -51,26 +88,42 @@ class SimulatorSource(MarketDataSource):
         time_scale: float = 200.0,
         seed: int | None = None,
         event_rate_per_min: float = 0.1,
+        mean_reversion: bool = True,
     ) -> None:
         super().__init__(cache)
-        self._rng = np.random.default_rng(seed)
+        if update_interval <= 0:
+            raise ValueError("update_interval must be > 0")
+        if time_scale <= 0:
+            raise ValueError("time_scale must be > 0")
+        if event_rate_per_min < 0:
+            raise ValueError("event_rate_per_min must be >= 0")
         self._dt = update_interval
-        self._scale = time_scale
+        self._time_scale = time_scale
         self._dtau = update_interval * time_scale / SECONDS_PER_TRADING_YEAR
-        self._p_event = min(1.0, max(0.0, event_rate_per_min / 60.0 * update_interval))
+        self._sqrt_dtau = math.sqrt(self._dtau)
+        self._p_event = min(1.0, event_rate_per_min / 60.0 * update_interval)
+        self._mean_reversion = mean_reversion
+        self._rng = np.random.default_rng(seed)
         self._state: dict[str, TickerState] = {}
         self._task: asyncio.Task | None = None
-        self.events: list[tuple[str, float]] = []  # (ticker, jump pct) of the last step
+        self._running = False
+        self.events: deque[tuple[str, float]] = deque(maxlen=100)  # recent (ticker, jump %)
+        self.event_count = 0  # total events ever, for consumers tailing ``events``
 
-    # ---- lifecycle -------------------------------------------------------------
+    # --- MarketDataSource ---
 
-    async def start(self, tickers: set[str]) -> None:
-        for t in sorted(tickers):
+    async def start(self, tickers: Iterable[str]) -> None:
+        for t in tickers:
             await self.add_ticker(t)
         if self._task is None or self._task.done():
+            self._running = True
             self._task = asyncio.create_task(self._run(), name="simulator-loop")
+        logger.info(
+            "Simulator started: %d tickers, time_scale=%g", len(self._state), self._time_scale
+        )
 
     async def stop(self) -> None:
+        self._running = False
         task, self._task = self._task, None
         if task and not task.done():
             task.cancel()
@@ -81,89 +134,127 @@ class SimulatorSource(MarketDataSource):
 
     async def add_ticker(self, ticker: str) -> bool:
         try:
-            ticker = normalize_ticker(ticker)
+            t = normalize_ticker(ticker)
         except ValueError:
             return False
-        if ticker in self._state:
-            return True
-        st = self._make_state(ticker, params_for(ticker))
-        self._state[ticker] = st
-        self.cache.update(ticker, snap_to_tick(st.open_price))
+        if t not in self._state:
+            self._state[t] = self._new_state(t)
+            self.cache.update(t, self._state[t].session_open)
+            logger.info("Simulator: tracking %s at ₩%s", t, f"{self._state[t].session_open:,}")
         return True
 
     async def remove_ticker(self, ticker: str) -> None:
         try:
-            ticker = normalize_ticker(ticker)
+            t = normalize_ticker(ticker)
         except ValueError:
             return
-        self._state.pop(ticker, None)
-        self.cache.remove(ticker)
+        self._state.pop(t, None)
+        self.cache.remove(t)
 
     @property
     def tickers(self) -> frozenset[str]:
         return frozenset(self._state)
 
     @property
-    def status(self) -> str:
-        return "ok" if self._task and not self._task.done() else "stopped"
+    def status(self) -> SourceStatus:
+        return "ok" if self._running else "stopped"
 
-    # ---- model -----------------------------------------------------------------
+    # --- Simulation ---
 
-    def _make_state(self, ticker: str, p: SeedParams) -> TickerState:
-        seed = float(p.seed_price)
-        sigma_real_sq = p.sigma**2 * self._scale / SECONDS_PER_TRADING_YEAR
-        kappa = sigma_real_sq / (2 * STATIONARY_STD**2)
-        lo, hi = seed * (1 - LIMIT_PCT), seed * (1 + LIMIT_PCT)
-        x0 = math.log(seed)
-        return TickerState(
-            ticker, p.sector, p.mu, p.sigma, p.beta_m, p.beta_s, p.beta_e, kappa,
-            x0, x0, seed, lo, hi, snap_up(lo), snap_down(hi),
-        )  # fmt: skip
+    def state(self, ticker: str) -> TickerState | None:
+        return self._state.get(ticker)
 
-    def _draw_jumps(self) -> dict[str, float]:
-        """Per-ticker log jump for this step (with sector contagion)."""
-        jumps: dict[str, float] = {}
-        self.events = []
-        if self._p_event <= 0:
-            return jumps
-        for t, st in self._state.items():
-            if self._rng.random() < self._p_event:
-                mag = self._rng.uniform(0.02, 0.05)
-                sign = 1.0 if self._rng.random() < 0.5 else -1.0
-                j = math.log(1 + sign * mag)
-                jumps[t] = jumps.get(t, 0.0) + j
-                self.events.append((t, round(sign * mag * 100, 2)))
-                logger.info("Simulator event: %s %+.2f%%", t, sign * mag * 100)
-                if st.sector != "other" and self._rng.random() < CONTAGION_PROB:
-                    for u, ost in self._state.items():
-                        if u != t and ost.sector == st.sector:
-                            jumps[u] = jumps.get(u, 0.0) + j * CONTAGION_SHARE
-        return jumps
-
-    def step(self) -> None:
-        """One simulation step. Public so tests can drive it without asyncio."""
+    def step(self) -> dict[str, int]:
+        """Advance every ticker one step. Publishes changed prices; returns them."""
         if not self._state:
-            return
-        z_m = self._rng.standard_normal()
-        z_s = {s: self._rng.standard_normal() for s in sorted({st.sector for st in self._state.values()})}
+            return {}
+        rng = self._rng
+        z_m = rng.standard_normal()
+        sectors = sorted({st.sector for st in self._state.values()})
+        z_s = dict(zip(sectors, rng.standard_normal(len(sectors)), strict=True))
+        eps = rng.standard_normal(len(self._state))
         jumps = self._draw_jumps()
-        sqrt_dtau = math.sqrt(self._dtau)
-        for t, st in self._state.items():
-            shock = st.bm * z_m + st.bs * z_s[st.sector] + st.be * self._rng.standard_normal()
-            dx = (st.mu - 0.5 * st.sigma**2) * self._dtau + st.sigma * sqrt_dtau * shock
-            dx -= st.kappa * (st.x - st.x_bar) * self._dt
+
+        published: dict[str, int] = {}
+        for i, (t, st) in enumerate(self._state.items()):
+            shock = st.beta_m * z_m + st.beta_s * z_s[st.sector] + st.beta_e * eps[i]
+            dx = (st.mu - 0.5 * st.sigma**2) * self._dtau + st.sigma * self._sqrt_dtau * shock
+            if self._mean_reversion:
+                dx -= st.kappa * (st.x - st.x_bar) * self._dt
             dx += jumps.get(t, 0.0)
-            st.x = min(max(st.x + dx, math.log(st.lo)), math.log(st.hi))
-            price = min(max(snap_to_tick(math.exp(st.x)), st.pub_lo), st.pub_hi)
+            st.x = self._clamp_log(st, st.x + dx)
+
+            price = min(max(snap_to_tick(math.exp(st.x)), st.lower), st.upper)
             if price != self.cache.price(t):
                 self.cache.update(t, price)
+                published[t] = price
+        return published
+
+    def _draw_jumps(self) -> dict[str, float]:
+        """Log-jumps for this step, including occasional same-sector contagion."""
+        if self._p_event <= 0:
+            return {}
+        jumps: dict[str, float] = {}
+        hits = self._rng.random(len(self._state)) < self._p_event
+        for hit, (t, st) in zip(hits, self._state.items(), strict=True):
+            if not hit:
+                continue
+            magnitude = self._rng.uniform(JUMP_MIN, JUMP_MAX)
+            sign = 1.0 if self._rng.random() < 0.5 else -1.0
+            jumps[t] = jumps.get(t, 0.0) + math.log1p(sign * magnitude)
+            self.events.append((t, round(sign * magnitude * 100, 2)))
+            self.event_count += 1
+            logger.info("Simulator event: %s %+.1f%%", t, sign * magnitude * 100)
+            if st.sector != DEFAULT_SECTOR and self._rng.random() < CONTAGION_PROB:
+                peer_jump = math.log1p(sign * magnitude * CONTAGION_FRACTION)
+                for peer, pst in self._state.items():
+                    if peer != t and pst.sector == st.sector:
+                        jumps[peer] = jumps.get(peer, 0.0) + peer_jump
+        return jumps
+
+    @staticmethod
+    def _clamp_log(st: TickerState, x: float) -> float:
+        lo = math.log(st.session_open * (1 - PRICE_LIMIT))
+        hi = math.log(st.session_open * (1 + PRICE_LIMIT))
+        return min(max(x, lo), hi)
+
+    def _new_state(self, ticker: str) -> TickerState:
+        params = SEED_PARAMS.get(ticker)
+        if params:
+            seed, sector, sigma = params.seed_price, params.sector, params.sigma
+            beta_m, beta_s, mu = params.beta_m, params.beta_s, params.mu
+        else:
+            seed, sector, sigma = stable_seed_price(ticker), DEFAULT_SECTOR, DEFAULT_SIGMA
+            beta_m, beta_s, mu = DEFAULT_BETA_M, 0.0, 0.05
+        beta_e = math.sqrt(max(0.0, 1.0 - beta_m**2 - beta_s**2))
+        sigma_real_sq = sigma**2 * self._time_scale / SECONDS_PER_TRADING_YEAR  # per second
+        kappa = sigma_real_sq / (2 * STATIONARY_LOG_STD**2)
+        lower, upper = limit_band(seed)
+        return TickerState(
+            ticker=ticker,
+            sector=sector,
+            mu=mu,
+            sigma=sigma,
+            beta_m=beta_m,
+            beta_s=beta_s,
+            beta_e=beta_e,
+            kappa=kappa,
+            x=math.log(seed),
+            x_bar=math.log(seed),
+            session_open=seed,
+            lower=lower,
+            upper=upper,
+        )
 
     async def _run(self) -> None:
         next_t = time.monotonic()
         while True:
             try:
                 self.step()
-            except Exception:  # never let the loop die
+            except Exception:
                 logger.exception("Simulator step failed")
             next_t += self._dt
-            await asyncio.sleep(max(0.0, next_t - time.monotonic()))
+            now = time.monotonic()
+            if next_t < now - self._dt:  # fell far behind (e.g. laptop sleep): resync
+                next_t = now
+            await asyncio.sleep(max(0.0, next_t - now))

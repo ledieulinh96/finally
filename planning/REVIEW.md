@@ -259,23 +259,26 @@ The following issues are most likely to cause implementation failures or agent-t
 
 Every finding above is now either **implemented in code** (market data, `backend/app/market/`) or **decided in `PLAN.md`** for the agents who build the remaining platform.
 
-### Implemented in the market data backend (PR #5, `backend/app/market/`)
+### Implemented in the market data backend
 
 | Finding | Resolution |
 |---|---|
-| SSE pushes stale prices 30× between yfinance polls | Sources write to the cache only on change. SSE sends only changed tickers (per-ticker events, `id` = cache version). A `: keepalive` comment goes out after 15 s idle. |
-| Empty cache on first SSE connect | Sources seed the cache on `start()` / `add_ticker()`. SSE sends a full snapshot on connect. |
-| yfinance unstable / rate-limited, no back-off | Batched polling in a worker thread, every exception caught, exponential back-off, `status == "degraded"` after repeated failures. NaN or missing symbols keep their last price. |
-| `.KS`/`.KQ` suffix guessing (Q1) | Bundled `backend/schema/krx_listing.csv` first, then a `.KS` → `.KQ` probe. |
-| `shortName` is Korean or terse; position name missing after watchlist removal | `NameRegistry` (in `listing.py`) is independent of the watchlist table. `TickerTracker` keeps held tickers priced (tracked = watchlist ∪ positions). |
-| Ticker validation unspecified | `^[0-9A-Z]{6}$` in `seed.py`. |
-| Trades when the cache has no price | The cache rejects non-int or non-positive prices. `TickerTracker.price_for_trade()` raises `PriceUnavailableError`, which maps to the "No price available" rejection. |
-| Missing SSE / thread-safety / conformance tests | Covered by `tests/market/` (90 tests). |
+| SSE pushes stale prices 30× between yfinance polls | Sources write to the cache only when the price changes. SSE sends only changed tickers (per-ticker events, `id` = cache version). A `: keepalive` comment goes out after 15 s idle. |
+| Empty cache on first SSE connect / first yfinance poll fails silently | `start()` and `add_ticker()` write a first price before returning. SSE sends a full snapshot on connect. A failed first poll is retried with back-off. |
+| Health check doesn't reflect yfinance state | `GET /api/health` returns `market_data` (`ok` / `degraded` / `stopped`), `source` and `market_session`. `degraded` is set after 3 consecutive poll failures. |
+| yfinance unstable / rate-limited, no back-off | One batched download per cycle, run in a worker thread. Every exception is caught. Exponential back-off runs from 15 s to 5 min. NaN or missing symbols keep their last price. |
+| `.KS`/`.KQ` suffix guessing & latency (Q1) | The bundled `backend/schema/krx_listing.csv` resolves the suffix without network calls. Only unlisted tickers are probed (`.KS`, then `.KQ`). Successful resolutions are memoized. |
+| `shortName` is Korean or terse | Names come from the listing first, then OpenDART, then `shortName`, then the ticker code, via `NameRegistry`. The SSE payload is UTF-8 (`ensure_ascii=False`). |
+| Position name missing after its watchlist row is removed | `NameRegistry` is independent of the watchlist table. `TickerTracker` keeps held tickers priced (tracked = watchlist ∪ positions). |
+| `session_open` semantics in yfinance mode | The first price seen after server start, the same as in the simulator. Documented in PLAN §6. |
+| KRX market hours: frozen prices look broken | `market_session()` (KST) is exposed in health. PLAN tells the frontend to show a "Market closed" badge in yfinance mode. The simulator runs 24/7 by design. |
+| Ticker validation unspecified | `normalize_ticker()`: `^[0-9A-Z]{6}$`; strips `.KS`/`.KQ`; string-only. |
+| Trades when the cache has no price | Sources never write 0 or non-int prices (the cache rejects them). PLAN requires a "No price available" rejection. |
+| Missing SSE tests, thread-safety test, full-universe test | `test_stream.py` covers the generator and a raw ASGI endpoint with disconnect. There is an 8-thread cache test. A conformance suite runs both sources on all 10 default tickers. |
+| uvicorn `--workers N` would split the cache | `app/main.py`, PLAN §3 and §11, and the backend docs all require `--workers 1`. |
+| Seed prices are stale | Documented in PLAN §7, with live yfinance figures from 2026-11-17. The seeds only drive the simulator. |
 
-**Still open for the backend agent** (decided in PLAN, not yet coded):
-- `main.py` / lifespan wiring and `GET /api/health`, including `market_session`, which needs a small KST session clock;
-- running with `--workers 1`;
-- OpenDART name lookup.
+**Still open for the backend agent:** OpenDART name lookup; reading watchlist ∪ positions from the DB in the lifespan (it currently starts with `DEFAULT_TICKERS`).
 
 ### Decided in PLAN.md (for the remaining agents)
 

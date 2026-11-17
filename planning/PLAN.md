@@ -150,6 +150,7 @@ LLM_MOCK=false
 # SIM_TIME_SCALE=200   # market-time speed-up so prices move ~1 tick per step
 # SIM_EVENT_RATE=0.1   # 2–5% jump events per ticker per minute; 0 disables
 # SIM_UPDATE_INTERVAL=0.5
+# YFINANCE_POLL_INTERVAL=15
 ```
 
 ### Behavior
@@ -196,7 +197,7 @@ Uses the `yfinance` Python library (`pip install yfinance`) — no API key or ac
 - Only changed prices are written to the cache (no repeated "flat" events between polls)
 - If a ticker is missing or returns NaN (bad code, delisted), it is skipped and the cache retains the last known price
 - Any poll error is caught; the poller backs off exponentially (15 s → 5 min) and `GET /api/health` reports `market_data: "degraded"` after 3 consecutive failures
-- **Market hours:** outside the KRX session (09:00–15:30 KST, weekdays) prices stay frozen at the last close. This is expected, not a bug. `GET /api/health` (to be built with `main.py`) returns `market_session` (`pre_open` | `regular` | `closing_auction` | `after_hours` | `closed`); in yfinance mode the frontend shows a "Market closed" badge when it is not `regular`/`closing_auction`. Exchange holidays are not modelled.
+- **Market hours:** outside the KRX session (09:00–15:30 KST, weekdays) prices stay frozen at the last close. This is expected, not a bug. `GET /api/health` returns `market_session` (`pre_open` | `regular` | `closing_auction` | `after_hours` | `closed`); in yfinance mode the frontend shows a "Market closed" badge when it is not `regular`/`closing_auction`. Exchange holidays are not modelled.
 - The container needs outbound HTTPS to Yahoo; do not run it with `--network none` in yfinance mode
 
 ### OpenDART Integration (Optional AI Enrichment)
@@ -606,7 +607,7 @@ All scripts should be idempotent — safe to run multiple times.
 ### Unit Tests (within `frontend/` and `backend/`)
 
 **Backend (pytest)**:
-- Market data (implemented — `backend/tests/market/`, 90 tests): simulator prices are int, tick-aligned and inside the ±30% band; factor model, mean reversion, jumps and seeding; yfinance poller maps `005930` → `005930.KS` and KOSDAQ → `.KQ`, handles missing/NaN tickers, backs off; both implementations pass one shared conformance suite; SSE snapshot/delta/resume/keepalive
+- Market data (implemented — `backend/tests/market/`): simulator prices are int, tick-aligned and inside the ±30% band; GBM moments, factor correlations, mean reversion and seeding are correct; yfinance poller maps `005930` → `005930.KS` and KOSDAQ → `.KQ`, handles missing/NaN tickers, backs off; both implementations pass one shared conformance suite; SSE snapshot/delta/resume/keepalive
 - Portfolio: trade execution logic, P&L calculations, avg_cost weighted average, edge cases (selling more than owned, buying with insufficient cash, quantity-zero row deletion)
 - LLM: structured output parsing handles all valid schemas, graceful handling of malformed responses, trade validation within chat flow, mock mode returns fixture
 - API routes: correct status codes, response shapes match Section 8 schemas, error handling

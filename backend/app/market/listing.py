@@ -1,52 +1,64 @@
-"""Bundled KRX listing (ticker -> English name + market) and a name registry."""
+"""Bundled KRX listing snapshot: English names and KOSPI/KOSDAQ market per ticker.
+
+The CSV at ``backend/schema/krx_listing.csv`` (columns ``ticker,name_en,market``)
+lets the backend resolve the yfinance suffix (PLAN Q1) and a display name
+without any network call. It is a hand-curated snapshot of large caps; tickers
+not in it fall back to ``.KS`` → ``.KQ`` probing and the yfinance ``shortName``.
+To extend it, append rows; ``FinanceDataReader.StockListing("KRX")`` gives the
+authoritative ``Market`` column (its names are Korean, so English names are
+added by hand or from OpenDART ``corp_name_eng``).
+"""
 
 from __future__ import annotations
 
 import csv
+import logging
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
-DEFAULT_LISTING_PATH = Path(__file__).resolve().parents[2] / "schema" / "krx_listing.csv"
+logger = logging.getLogger(__name__)
+
+Market = Literal["KOSPI", "KOSDAQ"]
+
+LISTING_PATH = Path(__file__).resolve().parents[2] / "schema" / "krx_listing.csv"
+
+YF_SUFFIX: dict[str, str] = {"KOSPI": ".KS", "KOSDAQ": ".KQ"}
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ListingEntry:
     ticker: str
-    name: str
-    market: str  # "KOSPI" | "KOSDAQ" | "KONEX"
+    name_en: str
+    market: Market
+
+    @property
+    def yf_symbol(self) -> str:
+        return self.ticker + YF_SUFFIX[self.market]
 
 
-def load_listing(path: Path | str = DEFAULT_LISTING_PATH) -> dict[str, ListingEntry]:
-    """Load the listing CSV; a missing file yields an empty listing."""
-    p = Path(path)
-    if not p.exists():
-        return {}
-    with p.open(newline="", encoding="utf-8") as f:
-        return {
-            row["ticker"].strip(): ListingEntry(
-                row["ticker"].strip(), row["name_en"].strip(), row["market"].strip().upper()
-            )
-            for row in csv.DictReader(f)
-            if row.get("ticker")
-        }
+def load_listing(path: Path = LISTING_PATH) -> dict[str, ListingEntry]:
+    """Parse the listing CSV. Rows with an unknown market are skipped."""
+    entries: dict[str, ListingEntry] = {}
+    try:
+        with path.open(newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                ticker = (row.get("ticker") or "").strip().upper()
+                market = (row.get("market") or "").strip().upper()
+                name = (row.get("name_en") or "").strip()
+                if len(ticker) != 6 or market not in YF_SUFFIX or not name:
+                    continue
+                entries[ticker] = ListingEntry(ticker, name, market)  # type: ignore[arg-type]
+    except FileNotFoundError:
+        logger.warning("KRX listing not found at %s; names fall back to ticker codes", path)
+    return entries
 
 
-def yfinance_suffix(market: str) -> str:
-    return ".KQ" if market.upper() == "KOSDAQ" else ".KS"
+@lru_cache(maxsize=1)
+def default_listing() -> dict[str, ListingEntry]:
+    return load_listing()
 
 
-class NameRegistry:
-    """ticker -> display name. Falls back to the listing, then to the ticker itself."""
-
-    def __init__(self, listing: dict[str, ListingEntry] | None = None) -> None:
-        self._listing = listing if listing is not None else load_listing()
-        self._names: dict[str, str] = {}
-
-    def set(self, ticker: str, name: str) -> None:
-        self._names[ticker] = name
-
-    def get(self, ticker: str) -> str:
-        if ticker in self._names:
-            return self._names[ticker]
-        entry = self._listing.get(ticker)
-        return entry.name if entry else ticker
+def lookup(ticker: str) -> ListingEntry | None:
+    return default_listing().get(ticker)

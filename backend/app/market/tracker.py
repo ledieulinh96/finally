@@ -1,48 +1,42 @@
-"""Tracked tickers = watchlist ∪ open positions (the only code that decides this)."""
+"""Keeps the source's tracked set equal to watchlist ∪ open positions.
+
+A stock you hold must keep a live price even after it leaves the watchlist,
+otherwise portfolio value and P&L freeze. The API layer computes the wanted set
+from the database and calls ``sync`` after any watchlist change or a trade that
+opens/closes a position. The tracker itself never touches the database.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import asyncio
+from collections.abc import Iterable
 
 from .base import MarketDataSource
-
-
-class PriceUnavailableError(RuntimeError):
-    """No price could be obtained for a ticker."""
+from .ticks import normalize_ticker
 
 
 class TickerTracker:
-    def __init__(
-        self,
-        source: MarketDataSource,
-        watchlist: Callable[[], set[str]],
-        positions: Callable[[], set[str]],
-    ) -> None:
+    def __init__(self, source: MarketDataSource) -> None:
         self.source = source
-        self._watchlist = watchlist
-        self._positions = positions
+        self._lock = asyncio.Lock()
 
-    def wanted(self) -> set[str]:
-        return set(self._watchlist()) | set(self._positions())
+    async def sync(self, watchlist: Iterable[str], positions: Iterable[str] = ()) -> set[str]:
+        """Add missing tickers and drop unwanted ones.
 
-    async def sync(self) -> set[str]:
-        """Make the source track exactly `wanted()`. Returns tickers it could not price."""
-        wanted = self.wanted()
+        Returns the wanted tickers the source could NOT price (e.g. unknown to
+        yfinance), so the caller can report them.
+        """
+        wanted = {normalize_ticker(t) for t in (*watchlist, *positions)}
         failed: set[str] = set()
-        for t in sorted(wanted - self.source.tickers):
-            if not await self.source.add_ticker(t):
-                failed.add(t)
-        for t in sorted(self.source.tickers - wanted):
-            await self.source.remove_ticker(t)
+        async with self._lock:
+            for t in sorted(wanted - self.source.tickers):
+                if not await self.source.add_ticker(t):
+                    failed.add(t)
+            for t in sorted(self.source.tickers - wanted):
+                await self.source.remove_ticker(t)
         return failed
 
-    async def price_for_trade(self, ticker: str) -> int:
-        """Cached price, adding the ticker to the source first if needed. Never returns 0."""
-        cache = self.source.cache
-        price = cache.price(ticker)
-        if price is None:
-            await self.source.add_ticker(ticker)
-            price = cache.price(ticker)
-        if price is None:
-            raise PriceUnavailableError("No price available")
-        return price
+    async def ensure(self, ticker: str) -> bool:
+        """Track one ticker (e.g. before buying something not on the watchlist)."""
+        async with self._lock:
+            return await self.source.add_ticker(normalize_ticker(ticker))

@@ -1,55 +1,43 @@
 # FinAlly Backend
 
-FastAPI backend for the FinAlly AI Trading Workstation.
+FastAPI backend for the FinAlly AI Trading Workstation (Korean equities: KOSPI/KOSDAQ).
 
 ## Structure
 
-- `app/` - Application code
-  - `market/` - Market data subsystem
-    - `models.py` - PriceUpdate dataclass
-    - `cache.py` - Thread-safe price cache
-    - `interface.py` - MarketDataSource abstract interface
-    - `simulator.py` - GBM-based market simulator
-    - `massive_client.py` - Massive/Polygon.io API client
-    - `factory.py` - Data source factory
-    - `stream.py` - SSE streaming endpoint
-    - `seed_prices.py` - Default ticker prices and parameters
+- `app/main.py`: the FastAPI app (lifespan, `/api/health`, SSE). Run it with a single worker.
+- `app/market/`: the market data subsystem. See `planning/MARKET_DATA_SUMMARY.md`.
+  - `models.py`: `PriceQuote` (int KRW)
+  - `cache.py`: thread-safe, versioned price cache
+  - `base.py`: `MarketDataSource` interface
+  - `simulator.py`: KRX simulator (factor-model GBM, jumps, mean reversion, ticks, ±30% limit)
+  - `yfinance_source.py`: yfinance poller (~20-min delayed real prices)
+  - `ticks.py`: KRX tick table and ticker validation
+  - `seed_data.py`: the 10 default KOSPI tickers and their parameters
+  - `listing.py` / `names.py`: bundled listing (`schema/krx_listing.csv`) and the name registry
+  - `market_hours.py`: KRX session clock (KST)
+  - `tracker.py`: keeps the tracked tickers equal to watchlist ∪ positions
+  - `factory.py`: env-driven source selection
+  - `stream.py`: the `GET /api/stream/prices` SSE endpoint
+- `schema/`: SQL schema/seed (to come) and `krx_listing.csv`
+- `tests/`: `market/` unit tests and `api/` app tests
 
-- `tests/` - Unit and integration tests
-  - `market/` - Market data tests
-
-## Running Tests
+## Running
 
 ```bash
-# Install dependencies
-uv sync --dev
-
-# Run all tests
-uv run pytest
-
-# Run with coverage
-uv run pytest --cov=app --cov-report=html
-
-# Run specific test file
-uv run pytest tests/market/test_simulator.py
-
-# Run with verbose output
-uv run pytest -v
+uv sync --extra dev
+uv run uvicorn app.main:app --port 8000 --workers 1
+uv run --extra dev pytest            # tests
+uv run --extra dev ruff check .      # lint
+uv run market_data_demo.py           # terminal demo
 ```
 
 ## Environment Variables
 
-- `MASSIVE_API_KEY` - Optional. If set, use real market data from Massive API. If not set, use the built-in simulator.
-
-## Development
-
-```bash
-# Install dependencies
-uv sync --dev
-
-# Run linter
-uv run ruff check .
-
-# Format code
-uv run ruff format .
-```
+| Variable | Default | Purpose |
+|---|---|---|
+| `USE_YFINANCE` | `false` | `true` polls real (~20-min delayed) prices via yfinance; otherwise the simulator runs |
+| `YFINANCE_POLL_INTERVAL` | `15` | Poll period in seconds |
+| `SIM_SEED` | random | Integer seed for reproducible simulator prices |
+| `SIM_TIME_SCALE` | `200` | Simulator market-time speed-up |
+| `SIM_EVENT_RATE` | `0.1` | Jump events per ticker per minute (`0` disables them) |
+| `SIM_UPDATE_INTERVAL` | `0.5` | Seconds per simulator step |

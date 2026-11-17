@@ -1,54 +1,59 @@
-"""Shared interface suite run against both sources."""
+"""Every MarketDataSource implementation honours the same contract."""
 
 import pytest
 
+from app.market.base import MarketDataSource
 from app.market.cache import PriceCache
+from app.market.seed_data import DEFAULT_TICKERS, SEED_PARAMS
 from app.market.simulator import SimulatorSource
 from app.market.ticks import tick_size
 from app.market.yfinance_source import YFinanceSource
 
-PRICES = {"005930.KS": 75000.0, "000660.KS": 180000.0, "035420.KS": 200000.0}
+from .fakes import FakeFetcher
 
 
-def sim(cache):
-    return SimulatorSource(cache, seed=1)
+def simulator():
+    return SimulatorSource(PriceCache(), update_interval=0.05, seed=1)
 
 
-def yf(cache):
-    return YFinanceSource(cache, last_price_fn=PRICES.get, batch_fn=lambda s: {k: PRICES[k] for k in s if k in PRICES})
+def yfinance():
+    prices = {f"{t}.KS": float(p.seed_price) + 37.0 for t, p in SEED_PARAMS.items()}
+    return YFinanceSource(PriceCache(), poll_interval=0.05, fetcher=FakeFetcher(prices))
 
 
-@pytest.fixture(params=[sim, yf], ids=["simulator", "yfinance"])
-def pair(request):
-    cache = PriceCache()
-    return cache, request.param(cache)
-
-
-async def test_start_prices_every_ticker(pair):
-    cache, src = pair
-    await src.start({"005930", "000660"})
-    try:
-        assert src.tickers == frozenset({"005930", "000660"})
-        for t in src.tickers:
-            p = cache.price(t)
-            assert type(p) is int and p > 0 and p % tick_size(p) == 0
-    finally:
-        await src.stop()
-
-
-async def test_add_remove_idempotent(pair):
-    cache, src = pair
-    assert await src.add_ticker("035420") and await src.add_ticker("035420")
-    assert cache.price("035420")
-    await src.remove_ticker("035420")
-    await src.remove_ticker("035420")
-    assert "035420" not in src.tickers and cache.get("035420") is None
-
-
-async def test_stop_idempotent_and_status(pair):
-    _, src = pair
+@pytest.fixture(params=[simulator, yfinance], ids=["simulator", "yfinance"])
+async def source(request):
+    src = request.param()
+    yield src
     await src.stop()
-    await src.start({"005930"})
-    await src.stop()
-    await src.stop()
-    assert src.status == "stopped"
+
+
+async def test_is_a_market_data_source(source):
+    assert isinstance(source, MarketDataSource)
+    assert source.status == "stopped"
+
+
+async def test_start_prices_every_ticker(source):
+    await source.start(DEFAULT_TICKERS)
+    assert source.tickers == frozenset(DEFAULT_TICKERS)
+    assert source.status == "ok"
+    for t in DEFAULT_TICKERS:
+        p = source.cache.price(t)
+        assert isinstance(p, int) and p > 0 and p % tick_size(p) == 0
+
+
+async def test_add_remove_idempotent(source):
+    await source.start(["005930"])
+    assert await source.add_ticker("000660")
+    assert await source.add_ticker("000660")
+    assert source.cache.price("000660") is not None
+    await source.remove_ticker("000660")
+    await source.remove_ticker("000660")
+    assert "000660" not in source.tickers and "000660" not in source.cache
+
+
+async def test_stop_idempotent(source):
+    await source.start(["005930"])
+    await source.stop()
+    await source.stop()
+    assert source.status == "stopped"
