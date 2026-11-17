@@ -57,13 +57,24 @@ docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
 | `LLM_MOCK` | No | `true` for deterministic mock LLM responses (testing) |
 | `GEMINI_API_KEY` | No | Dev tooling only — used by the Gemini review hook (see below) |
 
+## Backend development
+
+```bash
+cd backend
+uv sync --extra dev
+uv run uvicorn app.main:app --port 8000 --workers 1   # /api/health, /api/stream/prices
+uv run --extra dev pytest                              # market data test suite
+uv run market_data_demo.py                             # terminal price dashboard
+```
+
 ## Project Structure
 
 ```
 finally/
 ├── frontend/          # Next.js static export
 ├── backend/           # FastAPI uv project
-│   └── schema/        # SQL schema definitions and seed data
+│   ├── app/market/    # Market data: simulator, yfinance poller, price cache, SSE
+│   └── schema/        # SQL schema, seed data, krx_listing.csv
 ├── planning/          # Project documentation and agent contracts (PLAN.md)
 ├── test/              # Playwright E2E tests + docker-compose.test.yml
 ├── db/                # SQLite volume mount (finally.db is gitignored)

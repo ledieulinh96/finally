@@ -1,46 +1,41 @@
-import pytest
+"""TickerTracker keeps tracked set == watchlist ∪ positions."""
 
 from app.market.cache import PriceCache
 from app.market.simulator import SimulatorSource
-from app.market.tracker import PriceUnavailableError, TickerTracker
+from app.market.tracker import TickerTracker
+from app.market.yfinance_source import YFinanceSource
+
+from .fakes import FakeFetcher
 
 
-def setup(watch, pos):
-    cache = PriceCache()
-    src = SimulatorSource(cache, seed=1)
-    state = {"w": set(watch), "p": set(pos)}
-    return cache, src, state, TickerTracker(src, lambda: state["w"], lambda: state["p"])
-
-
-async def test_sync_tracks_union():
-    _, src, st, tr = setup({"005930"}, {"000660"})
-    assert await tr.sync() == set()
+async def test_sync_adds_and_removes():
+    src = SimulatorSource(PriceCache(), seed=1)
+    tracker = TickerTracker(src)
+    assert await tracker.sync(["005930", "000660"]) == set()
     assert src.tickers == {"005930", "000660"}
+    await tracker.sync(["005930"])
+    assert src.tickers == {"005930"} and "000660" not in src.cache
 
 
-async def test_held_ticker_stays_after_watchlist_removal_then_untracked_after_sell():
-    cache, src, st, tr = setup({"005930", "000660"}, {"000660"})
-    await tr.sync()
-    st["w"].discard("000660")
-    await tr.sync()
-    assert "000660" in src.tickers and cache.price("000660")
-    st["p"].discard("000660")
-    await tr.sync()
-    assert "000660" not in src.tickers and cache.get("000660") is None
+async def test_held_ticker_stays_tracked_after_watchlist_removal():
+    src = SimulatorSource(PriceCache(), seed=1)
+    tracker = TickerTracker(src)
+    await tracker.sync(["005930", "000660"], positions=["000660"])
+    await tracker.sync(["005930"], positions=["000660"])  # removed from watchlist, still held
+    assert "000660" in src.tickers and src.cache.price("000660") is not None
+    await tracker.sync(["005930"], positions=[])  # sold to zero
+    assert "000660" not in src.tickers
 
 
-async def test_sync_reports_unpriceable():
-    _, src, st, tr = setup({"005930", "BAD"}, set())
-    assert await tr.sync() == {"BAD"}
+async def test_sync_reports_unpriceable_tickers():
+    src = YFinanceSource(PriceCache(), fetcher=FakeFetcher({"005930.KS": 75_000.0}))
+    tracker = TickerTracker(src)
+    assert await tracker.sync(["005930", "999999"]) == {"999999"}
+    assert src.tickers == {"005930"}
 
 
-async def test_price_for_trade_adds_untracked():
-    cache, src, st, tr = setup(set(), set())
-    assert await tr.price_for_trade("005930") == 75_000
-    assert "005930" in src.tickers
-
-
-async def test_price_for_trade_rejects_unpriceable():
-    _, _, _, tr = setup(set(), set())
-    with pytest.raises(PriceUnavailableError, match="No price available"):
-        await tr.price_for_trade("NOPE")
+async def test_ensure_tracks_single_ticker():
+    src = SimulatorSource(PriceCache(), seed=1)
+    tracker = TickerTracker(src)
+    assert await tracker.ensure("035420")
+    assert src.cache.price("035420") == 200_000

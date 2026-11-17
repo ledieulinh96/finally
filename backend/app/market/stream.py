@@ -1,37 +1,80 @@
-"""SSE endpoint: GET /api/stream/prices."""
+"""SSE endpoint: GET /api/stream/prices.
+
+Protocol (planning/MARKET_DATA_INTERFACE.md §7)::
+
+    retry: 2000
+
+    id: 1542
+    data: {"ticker":"005930","name":"Samsung Electronics","price":75400,...}
+
+    : keepalive
+
+- One event per ticker, in the exact PLAN §6 payload shape.
+- ``id`` is the cache version. On connect every tracked ticker is sent (initial
+  snapshot); after that only tickers whose quote changed.
+- Reconnecting browsers send ``Last-Event-ID``; we resume from that version.
+  Quotes are latest-value data, so a version newer than the cache (server
+  restart) simply yields a fresh full snapshot.
+- A ``: keepalive`` comment is sent after ``keepalive`` seconds without data
+  (yfinance can be silent for minutes, and proxies drop idle connections).
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from .cache import PriceCache
+from .names import NameRegistry
 
-KEEPALIVE_SECONDS = 15.0
+logger = logging.getLogger(__name__)
+
+RETRY_MS = 2000
+
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",  # disable nginx buffering if proxied
+}
 
 
-async def generate_events(
+def parse_last_event_id(value: str | None, current_version: int) -> int:
+    """Starting version for a (re)connecting client. Unknown/future ids → 0 (full snapshot)."""
+    if value and value.strip().isdigit():
+        since = int(value.strip())
+        if since <= current_version:
+            return since
+    return 0
+
+
+def format_event(version: int, payload: dict) -> str:
+    return (
+        f"id: {version}\ndata: {json.dumps(payload, separators=(',', ':'), ensure_ascii=False)}\n\n"
+    )
+
+
+async def price_events(
     cache: PriceCache,
-    name_of: Callable[[str], str],
+    names: NameRegistry,
     is_disconnected: Callable[[], Awaitable[bool]],
     since: int = 0,
     interval: float = 0.5,
-    keepalive: float = KEEPALIVE_SECONDS,
+    keepalive: float = 15.0,
 ) -> AsyncGenerator[str, None]:
-    """Yield SSE frames: one event per changed ticker (all of them on first pass)."""
-    yield "retry: 2000\n\n"
+    """Yield SSE frames until ``is_disconnected()`` returns True."""
+    yield f"retry: {RETRY_MS}\n\n"
     idle = 0.0
     while not await is_disconnected():
         quotes = cache.changed_since(since)
         if quotes:
-            for q in quotes:
-                payload = json.dumps(q.to_event(name_of(q.ticker)), separators=(",", ":"))
-                yield f"id: {q.version}\ndata: {payload}\n\n"
-                since = max(since, q.version)
+            for quote in quotes:
+                yield format_event(quote.version, quote.to_event(names.get(quote.ticker)))
+                since = max(since, quote.version)
             idle = 0.0
         else:
             idle += interval
@@ -41,19 +84,25 @@ async def generate_events(
         await asyncio.sleep(interval)
 
 
-def create_stream_router(cache: PriceCache, name_of: Callable[[str], str] | None = None) -> APIRouter:
-    """Build a fresh router (safe to call more than once)."""
-    router = APIRouter()
-    resolve_name = name_of or (lambda t: t)
+def create_stream_router(
+    cache: PriceCache,
+    names: NameRegistry | None = None,
+    interval: float = 0.5,
+    keepalive: float = 15.0,
+) -> APIRouter:
+    """Build a fresh router (safe to call more than once, e.g. in tests)."""
+    registry = names or NameRegistry()
+    router = APIRouter(prefix="/api/stream", tags=["streaming"])
 
-    @router.get("/api/stream/prices")
+    @router.get("/prices")
     async def stream_prices(request: Request) -> StreamingResponse:
-        last_id = request.headers.get("last-event-id", "")
-        since = int(last_id) if last_id.isdigit() else 0
+        since = parse_last_event_id(request.headers.get("last-event-id"), cache.version)
+        client = request.client.host if request.client else "unknown"
+        logger.info("SSE client connected: %s (since=%d)", client, since)
         return StreamingResponse(
-            generate_events(cache, resolve_name, request.is_disconnected, since),
+            price_events(cache, registry, request.is_disconnected, since, interval, keepalive),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            headers=SSE_HEADERS,
         )
 
     return router

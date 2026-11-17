@@ -9,7 +9,13 @@ from .models import PriceQuote
 
 
 class PriceCache:
-    """Latest quote per ticker. Safe to write from a worker thread and read from the loop."""
+    """Latest quote per ticker.
+
+    Writers: exactly one MarketDataSource (simulator loop, or the yfinance poller
+    which may write from a worker thread). Readers: SSE stream, REST endpoints,
+    trade execution. Every write bumps a monotonically increasing ``version``;
+    SSE clients use it to send only what changed.
+    """
 
     def __init__(self) -> None:
         self._quotes: dict[str, PriceQuote] = {}
@@ -17,8 +23,15 @@ class PriceCache:
         self._lock = threading.Lock()
 
     def update(self, ticker: str, price: int, ts: datetime | None = None) -> PriceQuote:
-        if isinstance(price, bool) or not isinstance(price, int) or price <= 0:
-            raise ValueError(f"price must be a positive int, got {price!r}")
+        """Record a new price. ``price`` must be a positive int (KRW).
+
+        The first sighting of a ticker sets ``session_open`` and ``prev_price``
+        to the same value (direction ``flat``).
+        """
+        if isinstance(price, bool) or not isinstance(price, int):
+            raise TypeError(f"price must be int KRW, got {type(price).__name__}")
+        if price <= 0:
+            raise ValueError(f"price must be positive, got {price}")
         ts = ts or datetime.now(UTC)
         with self._lock:
             old = self._quotes.get(ticker)
@@ -39,20 +52,20 @@ class PriceCache:
             return self._quotes.get(ticker)
 
     def price(self, ticker: str) -> int | None:
-        q = self.get(ticker)
-        return q.price if q else None
+        quote = self.get(ticker)
+        return quote.price if quote else None
 
     def get_all(self) -> dict[str, PriceQuote]:
+        """Shallow copy of all current quotes."""
         with self._lock:
             return dict(self._quotes)
 
     def changed_since(self, version: int) -> list[PriceQuote]:
-        """Quotes written after `version`, oldest first."""
+        """Quotes written after ``version``, oldest first."""
         with self._lock:
-            return sorted(
-                (q for q in self._quotes.values() if q.version > version),
-                key=lambda q: q.version,
-            )
+            quotes = [q for q in self._quotes.values() if q.version > version]
+        quotes.sort(key=lambda q: q.version)
+        return quotes
 
     def remove(self, ticker: str) -> None:
         with self._lock:

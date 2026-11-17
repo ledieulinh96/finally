@@ -1,6 +1,6 @@
 # Market Data Simulator — Design
 
-**Status:** Design for the Market Data agent · **Date:** 2026-11-16
+**Status:** Implemented 2026-11-17 (see `MARKET_DATA_SUMMARY.md`); originally the design for the Market Data agent · **Date:** 2026-11-16
 **Related:** [`PLAN.md`](PLAN.md) §6–7, [`MARKET_DATA_INTERFACE.md`](MARKET_DATA_INTERFACE.md), [`MARKET_DATA_SOURCES.md`](MARKET_DATA_SOURCES.md)
 
 The simulator is FinAlly's **default** price source. It must:
