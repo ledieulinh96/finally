@@ -21,7 +21,7 @@ Single Docker container serving everything on port 8000:
 - **Backend**: FastAPI (Python/uv) with SSE streaming
 - **Database**: SQLite (`db/finally.db`) with lazy initialization
 - **AI**: LiteLLM → OpenRouter (`openai/gpt-oss-120b` on Cerebras) with structured outputs
-- **Market data**: Built-in GBM simulator (default) or 15-min delayed KRX prices via `yfinance` (optional)
+- **Market data**: Built-in KRX simulator (default: correlated GBM, real tick sizes, ±30% limit) or ~20-min delayed KRX prices via `yfinance` (optional)
 - **Fundamentals**: OpenDART corporate disclosures (optional) to enrich AI answers
 
 ## Quick Start
@@ -51,7 +51,8 @@ docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
 | Variable | Required | Description |
 |---|---|---|
 | `OPENROUTER_API_KEY` | Yes | OpenRouter API key for AI chat |
-| `USE_YFINANCE` | No | `true` to poll real (15-min delayed) KOSPI/KOSDAQ prices via yfinance; default uses the simulator |
+| `USE_YFINANCE` | No | `true` to poll real (~20-min delayed) KOSPI/KOSDAQ prices via yfinance; default uses the simulator |
+| `SIM_SEED`, `SIM_TIME_SCALE`, `SIM_EVENT_RATE`, `SIM_UPDATE_INTERVAL` | No | Simulator tuning (see `planning/MARKET_DATA_SUMMARY.md`) |
 | `OPENDART_API_KEY` | No | OpenDART key for company fundamentals and name lookup |
 | `LLM_MOCK` | No | `true` for deterministic mock LLM responses (testing) |
 | `GEMINI_API_KEY` | No | Dev tooling only — used by the Gemini review hook (see below) |
