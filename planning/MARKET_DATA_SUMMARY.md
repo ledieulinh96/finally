@@ -1,104 +1,127 @@
 # Market Data Backend — Summary
 
-**Status:** Complete, tested, reviewed, all issues resolved.
+**Status:** Complete for KRX (KOSPI/KOSDAQ). Tested: 147 tests passing, 98% line coverage, ruff clean.
+**Date:** 2026-11-17 · Designs: [`MARKET_DATA_INTERFACE.md`](MARKET_DATA_INTERFACE.md), [`MARKET_SIMULATOR.md`](MARKET_SIMULATOR.md), [`MARKET_DATA_SOURCES.md`](MARKET_DATA_SOURCES.md)
 
-## What Was Built
+The earlier US-market version (Massive/Polygon, AAPL…) is superseded. Its design docs remain in `planning/archive/` for history only.
 
-A complete market data subsystem in `backend/app/market/` (8 modules, ~500 lines) providing live price simulation and real market data via a unified interface.
-
-### Architecture
+## Architecture
 
 ```
-MarketDataSource (ABC)
-├── SimulatorDataSource  →  GBM simulator (default, no API key needed)
-└── MassiveDataSource    →  Polygon.io REST poller (when MASSIVE_API_KEY set)
-        │
+MarketDataSource (ABC, base.py)
+├── SimulatorSource   default — factor-model GBM + jumps + mean reversion, KRX ticks, ±30% band
+└── YFinanceSource    USE_YFINANCE=true — batched ~20-min-delayed Yahoo quotes, back-off
+        │  cache.update(ticker, int_price)   (only when the price changed)
         ▼
-   PriceCache (thread-safe, in-memory)
-        │
-        ├──→ SSE stream endpoint (/api/stream/prices)
-        ├──→ Portfolio valuation
-        └──→ Trade execution
+PriceCache (thread-safe, versioned; PriceQuote has price/prev_price/session_open as int KRW)
+        ├──→ SSE  GET /api/stream/prices   (snapshot on connect → per-ticker deltas, id = version)
+        ├──→ REST (watchlist, portfolio)    ← to be built
+        └──→ trade execution                ← to be built
 ```
 
-### Modules
+## Modules (`backend/app/market/`)
 
 | File | Purpose |
-|------|---------|
-| `models.py` | `PriceUpdate` — immutable frozen dataclass (ticker, price, previous_price, timestamp, change, direction) |
-| `interface.py` | `MarketDataSource` — abstract base class defining `start/stop/add_ticker/remove_ticker/get_tickers` |
-| `cache.py` | `PriceCache` — thread-safe price store with version counter for SSE change detection |
-| `seed_prices.py` | Realistic seed prices, per-ticker GBM params (drift/volatility), correlation groups |
-| `simulator.py` | `GBMSimulator` (Geometric Brownian Motion with Cholesky-correlated moves) + `SimulatorDataSource` |
-| `massive_client.py` | `MassiveDataSource` — REST polling client for Polygon.io via the `massive` package |
-| `factory.py` | `create_market_data_source()` — selects simulator or Massive based on `MASSIVE_API_KEY` env var |
-| `stream.py` | `create_stream_router()` — FastAPI SSE endpoint factory using version-based change detection |
+|---|---|
+| `models.py` | `PriceQuote` (frozen): `ticker, price, prev_price, session_open, timestamp, version`; `direction`, `change`, `session_change_pct`, `to_event(name)` = PLAN §6 payload |
+| `cache.py` | `PriceCache`: `update` (int > 0 only), `get`, `price`, `get_all`, `changed_since(version)`, `remove`, `version` |
+| `base.py` | `MarketDataSource` ABC: `start(tickers)`, `stop()`, `add_ticker() -> bool`, `remove_ticker()`, `tickers`, `status`, `name` |
+| `simulator.py` | `SimulatorSource`, with a public synchronous `step()` for tests and `events` / `event_count` for jump events |
+| `yfinance_source.py` | `YFinanceSource` + `YahooFetcher`. All network calls go through a `QuoteFetcher` protocol, so tests inject a fake |
+| `ticks.py` | KRX tick table, `snap_to_tick`, `limit_band`, `normalize_ticker` (`^[0-9A-Z]{6}$`, strips `.KS/.KQ`) |
+| `seed_data.py` | Default 10 KOSPI tickers: names, seed prices, sector, σ, β_m, β_s |
+| `listing.py` | Loads `backend/schema/krx_listing.csv` (65 large caps: English name + KOSPI/KOSDAQ) |
+| `names.py` | `NameRegistry`: ticker → English name; falls back to the code, never fails |
+| `market_hours.py` | `market_session()` → `pre_open / regular / closing_auction / after_hours / closed` (KST, weekdays; holidays not modelled) |
+| `tracker.py` | `TickerTracker.sync(watchlist, positions)` keeps the tracked set = watchlist ∪ positions |
+| `factory.py` | `MarketSettings.from_env()` and `create_market_data_source(cache, settings, names)` |
+| `stream.py` | `create_stream_router(cache, names)` (a fresh router per call) and `price_events(...)` |
 
-### Key Design Decisions
+`backend/app/main.py`:
+- `create_app()` wires the cache, the source, the name registry and the tracker into `app.state`;
+- the lifespan starts and stops the source (it currently starts with `DEFAULT_TICKERS`; it should read watchlist ∪ positions once the DB exists);
+- exposes `GET /api/health` and the SSE route.
 
-- **Strategy pattern** — both data sources implement the same ABC; downstream code is source-agnostic
-- **PriceCache as single point of truth** — producers write, consumers read; no direct coupling
-- **GBM with correlated moves** — Cholesky decomposition of sector-based correlation matrix; tech stocks correlate at 0.6, finance at 0.5, cross-sector at 0.3
-- **Random shock events** — ~0.1% chance per tick per ticker of a 2-5% move for visual drama
-- **SSE over WebSockets** — simpler, one-way push, universal browser support
+Run it with `--workers 1`.
 
-## Test Suite
+## Behaviour highlights
 
-**73 tests, all passing.** 6 test modules in `backend/tests/market/`.
+- **Integer KRW on real ticks.** Samsung moves in ₩100 steps; Samsung Biologics moves in ₩1,000 steps.
+- **Lively but sane simulator.**
+  - `SIM_TIME_SCALE=200` gives about 1 tick per step.
+  - Same-sector correlation is about 0.73 (Samsung–SK Hynix); cross-sector correlation is about 0.25.
+  - Jumps of 2–5% happen about once per ticker every 10 minutes, with 30% sector contagion.
+  - An OU pull holds prices within about ±15% (1σ).
+  - Prices are clamped to ±30% of `session_open`.
+- **Deterministic tests and E2E.** Set `SIM_SEED`. Unknown tickers get a crc32-derived seed price that is stable across restarts.
+- **yfinance resolution.** The listing CSV is checked first, then `.KS`, then `.KQ`.
+  - Unknown tickers are rejected with `add_ticker → False`.
+  - Failed lookups are not memoized, so a network blip doesn't ban a ticker.
+- **yfinance polling.** One batched download per cycle, run in a worker thread.
+  - NaN or missing data keeps the last price.
+  - Exponential back-off up to 5 min; after 3 consecutive failures the status becomes `degraded`.
+  - Only changed prices are written.
+- **SSE protocol.**
+  - `retry: 2000`.
+  - Each event's `id` is the cache version, so clients can resume with `Last-Event-ID`.
+  - An unknown or future id gets a full snapshot.
+  - A `: keepalive` comment is sent after 15 s of idle.
+  - The stream stops when the client disconnects.
 
-| Module | Tests | Coverage |
-|--------|-------|----------|
-| test_models.py | 11 | models.py: 100% |
-| test_cache.py | 13 | cache.py: 100% |
-| test_simulator.py | 17 | simulator.py: 98% |
-| test_simulator_source.py | 10 | (integration tests) |
-| test_factory.py | 7 | factory.py: 100% |
-| test_massive.py | 13 | massive_client.py: 56% (expected — API methods mocked) |
+## Configuration
 
-Overall coverage: 84%.
+| Env | Default | Meaning |
+|---|---|---|
+| `USE_YFINANCE` | `false` | `true` uses the yfinance poller |
+| `YFINANCE_POLL_INTERVAL` | `15` | seconds |
+| `SIM_SEED` | random | int for reproducible prices |
+| `SIM_TIME_SCALE` | `200` | market-time speed-up |
+| `SIM_EVENT_RATE` | `0.1` | jump events per ticker per minute; `0` disables them |
+| `SIM_UPDATE_INTERVAL` | `0.5` | seconds per step |
 
-## Code Review & Fixes Applied
+Invalid values fall back to the defaults, with a warning.
 
-A comprehensive code review identified 7 issues. All were resolved:
+## Tests (`backend/tests/`)
 
-1. **pyproject.toml build config** — added `[tool.hatch.build.targets.wheel] packages = ["app"]`
-2. **Lazy imports removed** — `massive` is a core dependency; imports moved to top level
-3. **SSE return type fixed** — `_generate_events` annotated as `AsyncGenerator[str, None]`
-4. **Public `get_tickers()`** — added to `GBMSimulator` to avoid private attribute access
-5. **Correlation constants cleaned up** — removed unused `DEFAULT_CORR`, consolidated into `CROSS_GROUP_CORR`
-6. **Unused test imports removed** — `pytest`, `math`, `asyncio` cleaned from 4 test files
-7. **Massive test mocks fixed** — `source._client` set in tests, patches target correct names
+| Module | Covers |
+|---|---|
+| `market/test_ticks.py` | tick bands, snapping, limit band, ticker validation |
+| `market/test_models.py` | direction, pct, exact PLAN payload |
+| `market/test_cache.py` | session_open, `changed_since`, int-only, 8-thread concurrency |
+| `market/test_simulator.py` | int/tick/band over 5k steps, GBM moments, factor correlations, OU half-life, determinism, jumps, unknown tickers, loop survives exceptions |
+| `market/test_yfinance.py` | suffix mapping, probing, NaN/missing, back-off/degraded, DataFrame parsing (no network) |
+| `market/test_conformance.py` | one contract suite run against both sources |
+| `market/test_stream.py` | snapshot → deltas, resume, keepalive, headers, raw-ASGI endpoint with disconnect |
+| `market/test_tracker.py`, `test_factory.py`, `test_market_hours.py`, `test_listing_names.py` | as named |
+| `api/test_app.py` | lifespan start/stop, `/api/health` |
+
+Also verified manually on 2026-11-17:
+- uvicorn served `/api/health` and the live SSE stream, including `Last-Event-ID` resume;
+- real yfinance returned prices for `005930.KS`, `000660.KS` and `247540.KQ`.
+
+## Usage for downstream code
+
+```python
+from app.market import PriceCache, NameRegistry, TickerTracker, create_market_data_source, create_stream_router
+
+cache, names = PriceCache(), NameRegistry()
+source = create_market_data_source(cache, names=names)   # reads USE_YFINANCE / SIM_*
+await source.start(watchlist | positions)
+app.include_router(create_stream_router(cache, names))
+
+cache.price("005930")                      # int | None — fill price for trades (reject None)
+cache.get("005930")                        # PriceQuote | None
+ok = await source.add_ticker("247540")     # False → respond 404 "Unknown ticker"
+await TickerTracker(source).sync(watchlist, positions)   # after watchlist changes / opening or closing trades
+names.get("005930")                        # "Samsung Electronics"
+```
+
+## Review items addressed
+
+See the "Resolution" section of [`REVIEW.md`](REVIEW.md).
 
 ## Demo
 
-A Rich terminal demo is available at `backend/market_data_demo.py`:
-
 ```bash
-cd backend
-uv run market_data_demo.py
-```
-
-Displays a live-updating dashboard with all 10 tickers, sparklines, color-coded direction arrows, and an event log for notable price moves. Runs 60 seconds or until Ctrl+C.
-
-## Usage for Downstream Code
-
-```python
-from app.market import PriceCache, create_market_data_source
-
-# Startup
-cache = PriceCache()
-source = create_market_data_source(cache)  # Reads MASSIVE_API_KEY
-await source.start(["AAPL", "GOOGL", "MSFT", ...])
-
-# Read prices
-update = cache.get("AAPL")          # PriceUpdate or None
-price = cache.get_price("AAPL")     # float or None
-all_prices = cache.get_all()        # dict[str, PriceUpdate]
-
-# Dynamic watchlist
-await source.add_ticker("TSLA")
-await source.remove_ticker("GOOGL")
-
-# Shutdown
-await source.stop()
+cd backend && uv run market_data_demo.py   # 60 s Rich dashboard: ₩ prices, names, sparklines, jump events
 ```

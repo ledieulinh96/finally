@@ -2,74 +2,84 @@
 
 from __future__ import annotations
 
-import time
-from threading import Lock
+import threading
+from datetime import UTC, datetime
 
-from .models import PriceUpdate
+from .models import PriceQuote
 
 
 class PriceCache:
-    """Thread-safe in-memory cache of the latest price for each ticker.
+    """Latest quote per ticker.
 
-    Writers: SimulatorDataSource or MassiveDataSource (one at a time).
-    Readers: SSE streaming endpoint, portfolio valuation, trade execution.
+    Writers: exactly one MarketDataSource (simulator loop, or the yfinance poller
+    which may write from a worker thread). Readers: SSE stream, REST endpoints,
+    trade execution. Every write bumps a monotonically increasing ``version``;
+    SSE clients use it to send only what changed.
     """
 
     def __init__(self) -> None:
-        self._prices: dict[str, PriceUpdate] = {}
-        self._lock = Lock()
-        self._version: int = 0  # Monotonically increasing; bumped on every update
+        self._quotes: dict[str, PriceQuote] = {}
+        self._version = 0
+        self._lock = threading.Lock()
 
-    def update(self, ticker: str, price: float, timestamp: float | None = None) -> PriceUpdate:
-        """Record a new price for a ticker. Returns the created PriceUpdate.
+    def update(self, ticker: str, price: int, ts: datetime | None = None) -> PriceQuote:
+        """Record a new price. ``price`` must be a positive int (KRW).
 
-        Automatically computes direction and change from the previous price.
-        If this is the first update for the ticker, previous_price == price (direction='flat').
+        The first sighting of a ticker sets ``session_open`` and ``prev_price``
+        to the same value (direction ``flat``).
         """
+        if isinstance(price, bool) or not isinstance(price, int):
+            raise TypeError(f"price must be int KRW, got {type(price).__name__}")
+        if price <= 0:
+            raise ValueError(f"price must be positive, got {price}")
+        ts = ts or datetime.now(UTC)
         with self._lock:
-            ts = timestamp or time.time()
-            prev = self._prices.get(ticker)
-            previous_price = prev.price if prev else price
-
-            update = PriceUpdate(
-                ticker=ticker,
-                price=round(price, 2),
-                previous_price=round(previous_price, 2),
-                timestamp=ts,
-            )
-            self._prices[ticker] = update
+            old = self._quotes.get(ticker)
             self._version += 1
-            return update
+            quote = PriceQuote(
+                ticker=ticker,
+                price=price,
+                prev_price=old.price if old else price,
+                session_open=old.session_open if old else price,
+                timestamp=ts,
+                version=self._version,
+            )
+            self._quotes[ticker] = quote
+            return quote
 
-    def get(self, ticker: str) -> PriceUpdate | None:
-        """Get the latest price for a single ticker, or None if unknown."""
+    def get(self, ticker: str) -> PriceQuote | None:
         with self._lock:
-            return self._prices.get(ticker)
+            return self._quotes.get(ticker)
 
-    def get_all(self) -> dict[str, PriceUpdate]:
-        """Snapshot of all current prices. Returns a shallow copy."""
+    def price(self, ticker: str) -> int | None:
+        quote = self.get(ticker)
+        return quote.price if quote else None
+
+    def get_all(self) -> dict[str, PriceQuote]:
+        """Shallow copy of all current quotes."""
         with self._lock:
-            return dict(self._prices)
+            return dict(self._quotes)
 
-    def get_price(self, ticker: str) -> float | None:
-        """Convenience: get just the price float, or None."""
-        update = self.get(ticker)
-        return update.price if update else None
+    def changed_since(self, version: int) -> list[PriceQuote]:
+        """Quotes written after ``version``, oldest first."""
+        with self._lock:
+            quotes = [q for q in self._quotes.values() if q.version > version]
+        quotes.sort(key=lambda q: q.version)
+        return quotes
 
     def remove(self, ticker: str) -> None:
-        """Remove a ticker from the cache (e.g., when removed from watchlist)."""
         with self._lock:
-            self._prices.pop(ticker, None)
+            self._quotes.pop(ticker, None)
 
     @property
     def version(self) -> int:
-        """Current version counter. Useful for SSE change detection."""
-        return self._version
+        with self._lock:
+            return self._version
 
     def __len__(self) -> int:
         with self._lock:
-            return len(self._prices)
+            return len(self._quotes)
 
-    def __contains__(self, ticker: str) -> bool:
+    def __contains__(self, ticker: object) -> bool:
         with self._lock:
-            return ticker in self._prices
+            return ticker in self._quotes

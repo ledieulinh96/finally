@@ -1,103 +1,86 @@
-"""Tests for PriceCache."""
+"""PriceCache: versioning, session_open, thread safety, int-only prices."""
+
+import threading
+
+import pytest
 
 from app.market.cache import PriceCache
 
 
-class TestPriceCache:
-    """Unit tests for the PriceCache."""
+def test_first_update_is_flat_and_sets_session_open():
+    c = PriceCache()
+    q = c.update("005930", 75_000)
+    assert (q.price, q.prev_price, q.session_open, q.direction) == (75_000, 75_000, 75_000, "flat")
+    assert q.version == 1 and c.version == 1
 
-    def test_update_and_get(self):
-        """Test updating and getting a price."""
-        cache = PriceCache()
-        update = cache.update("AAPL", 190.50)
-        assert update.ticker == "AAPL"
-        assert update.price == 190.50
-        assert cache.get("AAPL") == update
 
-    def test_first_update_is_flat(self):
-        """Test that the first update has flat direction."""
-        cache = PriceCache()
-        update = cache.update("AAPL", 190.50)
-        assert update.direction == "flat"
-        assert update.previous_price == 190.50
+def test_subsequent_update_keeps_session_open():
+    c = PriceCache()
+    c.update("005930", 75_000)
+    c.update("005930", 75_100)
+    q = c.update("005930", 74_900)
+    assert (q.prev_price, q.session_open, q.direction) == (75_100, 75_000, "down")
+    assert c.price("005930") == 74_900
 
-    def test_direction_up(self):
-        """Test price update with upward direction."""
-        cache = PriceCache()
-        cache.update("AAPL", 190.00)
-        update = cache.update("AAPL", 191.00)
-        assert update.direction == "up"
-        assert update.change == 1.00
 
-    def test_direction_down(self):
-        """Test price update with downward direction."""
-        cache = PriceCache()
-        cache.update("AAPL", 190.00)
-        update = cache.update("AAPL", 189.00)
-        assert update.direction == "down"
-        assert update.change == -1.00
+def test_changed_since_returns_only_newer_in_version_order():
+    c = PriceCache()
+    c.update("A00001", 1_000)
+    c.update("B00002", 2_000)
+    v = c.version
+    c.update("B00002", 2_005)
+    c.update("A00001", 1_001)
+    changed = c.changed_since(v)
+    assert [q.ticker for q in changed] == ["B00002", "A00001"]
+    assert c.changed_since(c.version) == []
+    assert len(c.changed_since(0)) == 2
 
-    def test_remove(self):
-        """Test removing a ticker from cache."""
-        cache = PriceCache()
-        cache.update("AAPL", 190.00)
-        cache.remove("AAPL")
-        assert cache.get("AAPL") is None
 
-    def test_remove_nonexistent(self):
-        """Test removing a ticker that doesn't exist."""
-        cache = PriceCache()
-        cache.remove("AAPL")  # Should not raise
+def test_remove_get_all_len_contains():
+    c = PriceCache()
+    c.update("005930", 75_000)
+    c.update("000660", 180_000)
+    assert len(c) == 2 and "005930" in c
+    assert set(c.get_all()) == {"005930", "000660"}
+    c.remove("005930")
+    c.remove("005930")  # idempotent
+    assert c.get("005930") is None and c.price("005930") is None
+    assert "005930" not in c
 
-    def test_get_all(self):
-        """Test getting all prices."""
-        cache = PriceCache()
-        cache.update("AAPL", 190.00)
-        cache.update("GOOGL", 175.00)
-        all_prices = cache.get_all()
-        assert set(all_prices.keys()) == {"AAPL", "GOOGL"}
 
-    def test_version_increments(self):
-        """Test that version counter increments."""
-        cache = PriceCache()
-        v0 = cache.version
-        cache.update("AAPL", 190.00)
-        assert cache.version == v0 + 1
-        cache.update("AAPL", 191.00)
-        assert cache.version == v0 + 2
+def test_removed_ticker_restarts_session():
+    c = PriceCache()
+    c.update("005930", 75_000)
+    c.remove("005930")
+    assert c.update("005930", 80_000).session_open == 80_000
 
-    def test_get_price_convenience(self):
-        """Test the convenience get_price method."""
-        cache = PriceCache()
-        cache.update("AAPL", 190.50)
-        assert cache.get_price("AAPL") == 190.50
-        assert cache.get_price("NOPE") is None
 
-    def test_len(self):
-        """Test __len__ method."""
-        cache = PriceCache()
-        assert len(cache) == 0
-        cache.update("AAPL", 190.00)
-        assert len(cache) == 1
-        cache.update("GOOGL", 175.00)
-        assert len(cache) == 2
+@pytest.mark.parametrize("bad", [75_000.5, "75000", True, None])
+def test_rejects_non_int_prices(bad):
+    with pytest.raises(TypeError):
+        PriceCache().update("005930", bad)
 
-    def test_contains(self):
-        """Test __contains__ method."""
-        cache = PriceCache()
-        cache.update("AAPL", 190.00)
-        assert "AAPL" in cache
-        assert "GOOGL" not in cache
 
-    def test_custom_timestamp(self):
-        """Test updating with a custom timestamp."""
-        cache = PriceCache()
-        custom_ts = 1234567890.0
-        update = cache.update("AAPL", 190.50, timestamp=custom_ts)
-        assert update.timestamp == custom_ts
+@pytest.mark.parametrize("bad", [0, -100])
+def test_rejects_non_positive_prices(bad):
+    with pytest.raises(ValueError):
+        PriceCache().update("005930", bad)
 
-    def test_price_rounding(self):
-        """Test that prices are rounded to 2 decimal places."""
-        cache = PriceCache()
-        update = cache.update("AAPL", 190.12345)
-        assert update.price == 190.12
+
+def test_concurrent_writers_lose_no_updates():
+    c = PriceCache()
+    n_threads, n_updates = 8, 2_000
+
+    def writer(i):
+        for k in range(n_updates):
+            c.update(f"{i:06d}", 1_000 + k)
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert c.version == n_threads * n_updates
+    assert len(c) == n_threads
+    versions = sorted(q.version for q in c.get_all().values())
+    assert len(set(versions)) == n_threads

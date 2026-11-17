@@ -2,8 +2,8 @@
 
 Run with:  uv run market_data_demo.py
 
-Displays a live-updating terminal dashboard of simulated stock prices
-using the GBM simulator and Rich library.
+Displays a live-updating terminal dashboard of simulated KOSPI prices
+(integer KRW on real KRX ticks) using the simulator and the Rich library.
 """
 
 from __future__ import annotations
@@ -20,14 +20,16 @@ from rich.table import Table
 from rich.text import Text
 
 from app.market.cache import PriceCache
-from app.market.seed_prices import SEED_PRICES
-from app.market.simulator import SimulatorDataSource
+from app.market.names import NameRegistry
+from app.market.seed_data import DEFAULT_TICKERS, SEED_PARAMS
+from app.market.simulator import SimulatorSource
 
 # Sparkline characters, low to high
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
 # Ordered ticker list matching the default watchlist
-TICKERS = ["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA", "NVDA", "META", "JPM", "V", "NFLX"]
+TICKERS = list(DEFAULT_TICKERS)
+NAMES = NameRegistry()
 
 DURATION = 60  # seconds
 
@@ -44,11 +46,9 @@ def sparkline(values: list[float]) -> str:
     return "".join(SPARK_CHARS[int((v - lo) / spread * n)] for v in values)
 
 
-def format_price(price: float) -> str:
-    """Format a price with comma separator."""
-    if price >= 1000:
-        return f"{price:,.2f}"
-    return f"{price:.2f}"
+def format_price(price: int) -> str:
+    """Format a KRW price: ₩75,400."""
+    return f"\u20a9{price:,}"
 
 
 def build_table(
@@ -66,16 +66,17 @@ def build_table(
         padding=(0, 1),
     )
     table.add_column("Ticker", style="bold bright_white", width=8)
-    table.add_column("Price", justify="right", width=10)
-    table.add_column("Change", justify="right", width=9)
-    table.add_column("Chg %", justify="right", width=8)
+    table.add_column("Name", width=20, no_wrap=True)
+    table.add_column("Price", justify="right", width=11)
+    table.add_column("Change", justify="right", width=8)
+    table.add_column("Session %", justify="right", width=9)
     table.add_column("", width=3)  # arrow
     table.add_column("Sparkline", width=42, no_wrap=True)
 
     for ticker in TICKERS:
         update = cache.get(ticker)
         if update is None:
-            table.add_row(ticker, "---", "---", "---", "", "")
+            table.add_row(ticker, NAMES.get(ticker), "---", "---", "---", "", "")
             continue
 
         # Direction styling
@@ -89,15 +90,15 @@ def build_table(
             color = "bright_black"
             arrow = "[bright_black]\u2500[/]"
 
-        price_str = f"[{color}]${format_price(update.price)}[/]"
-        change_str = f"[{color}]{update.change:+.2f}[/]"
-        pct_str = f"[{color}]{update.change_percent:+.2f}%[/]"
+        price_str = f"[{color}]{format_price(update.price)}[/]"
+        change_str = f"[{color}]{update.change:+,}[/]"
+        pct_str = f"[{color}]{update.session_change_pct:+.2f}%[/]"
 
         # Sparkline from history
         vals = list(history.get(ticker, []))
         spark_str = f"[bright_cyan]{sparkline(vals)}[/]" if len(vals) > 1 else ""
 
-        table.add_row(ticker, price_str, change_str, pct_str, arrow, spark_str)
+        table.add_row(ticker, NAMES.get(ticker), price_str, change_str, pct_str, arrow, spark_str)
 
     return table
 
@@ -109,7 +110,7 @@ def build_event_log(events: deque) -> Panel:
         text.append(evt)
         text.append("\n")
     if not events:
-        text.append("Watching for notable moves (>1% change)...", style="bright_black italic")
+        text.append("Watching for simulator events (2-5% jumps)...", style="bright_black italic")
     return Panel(
         text,
         title="[bold bright_yellow]Recent Events[/]",
@@ -138,7 +139,7 @@ def build_dashboard(
     # Header
     header_text = Text.assemble(
         ("  FinAlly ", "bold bright_yellow"),
-        ("Market Data Simulator", "bold bright_white"),
+        ("KRX Market Data Simulator", "bold bright_white"),
         ("  |  ", "bright_black"),
         (f"{elapsed:5.1f}s elapsed", "bright_cyan"),
         ("  |  ", "bright_black"),
@@ -179,7 +180,7 @@ def print_summary(cache: PriceCache) -> None:
     table.add_column("Session Change", justify="right", width=14)
 
     for ticker in TICKERS:
-        seed = SEED_PRICES.get(ticker, 0)
+        seed = SEED_PARAMS[ticker].seed_price
         update = cache.get(ticker)
         if update is None:
             continue
@@ -195,8 +196,8 @@ def print_summary(cache: PriceCache) -> None:
 
         table.add_row(
             ticker,
-            f"${format_price(seed)}",
-            f"[{color}]${format_price(final)}[/]",
+            format_price(seed),
+            f"[{color}]{format_price(final)}[/]",
             f"[{color}]{session_change:+.2f}%[/]",
         )
 
@@ -207,7 +208,8 @@ def print_summary(cache: PriceCache) -> None:
 async def run() -> None:
     """Main demo loop."""
     cache = PriceCache()
-    source = SimulatorDataSource(price_cache=cache, update_interval=0.5)
+    source = SimulatorSource(cache, update_interval=0.5)
+    seen_events = 0
 
     # Per-ticker price history for sparklines
     history: dict[str, deque] = {t: deque(maxlen=40) for t in TICKERS}
@@ -239,24 +241,26 @@ async def run() -> None:
                     continue
                 last_version = cache.version
 
-                # Record history & detect events
+                # Record history
                 for ticker in TICKERS:
                     update = cache.get(ticker)
-                    if update is None:
-                        continue
-                    history[ticker].append(update.price)
+                    if update is not None:
+                        history[ticker].append(update.price)
 
-                    # Log notable moves
-                    if abs(update.change_percent) > 1.0:
-                        direction = "\u25b2" if update.direction == "up" else "\u25bc"
-                        color = "green" if update.direction == "up" else "red"
-                        timestamp = time.strftime("%H:%M:%S")
-                        events.appendleft(
-                            f"[bright_black]{timestamp}[/]  "
-                            f"[bold {color}]{direction} {ticker}[/]  "
-                            f"[{color}]{update.change_percent:+.2f}%[/]  "
-                            f"${format_price(update.price)}"
-                        )
+                # Log simulator jump events
+                fresh = min(source.event_count - seen_events, len(source.events))
+                new_events = list(source.events)[-fresh:] if fresh else []
+                seen_events = source.event_count
+                for ticker, pct in new_events:
+                    update = cache.get(ticker)
+                    color = "green" if pct > 0 else "red"
+                    arrow = "\u25b2" if pct > 0 else "\u25bc"
+                    events.appendleft(
+                        f"[bright_black]{time.strftime('%H:%M:%S')}[/]  "
+                        f"[bold {color}]{arrow} {ticker} {NAMES.get(ticker)}[/]  "
+                        f"[{color}]{pct:+.2f}%[/]  "
+                        f"{format_price(update.price) if update else ''}"
+                    )
 
                 live.update(build_dashboard(cache, history, events, start_time))
 

@@ -1,6 +1,6 @@
 # Market Data Interface — Design
 
-**Status:** Design for the Market Data / Backend agents · **Date:** 2026-11-16
+**Status:** Implemented 2026-11-17 (see `MARKET_DATA_SUMMARY.md`); originally the design for the Market Data / Backend agents · **Date:** 2026-11-16
 **Related:** [`PLAN.md`](PLAN.md) §6 & §8, [`MARKET_DATA_SOURCES.md`](MARKET_DATA_SOURCES.md), [`MARKET_SIMULATOR.md`](MARKET_SIMULATOR.md)
 
 This document defines how price data flows through the backend:
@@ -9,6 +9,12 @@ This document defines how price data flows through the backend:
 - one **SSE** endpoint,
 
 so that the simulator, the yfinance poller and any future real-time feed are interchangeable. Everything downstream of the cache knows nothing about where prices come from.
+
+> **Implementation notes.** The shipped code follows this design, with four differences:
+> - the factory is `create_market_data_source(cache, settings, names)`;
+> - it adds the extra modules `seed_data.py`, `listing.py`, `names.py`, `market_hours.py` and `tracker.py`;
+> - `TickerTracker.sync(watchlist, positions)` takes the wanted sets from the caller instead of querying the DB;
+> - `yfinance` is a regular dependency, but it is imported only when used.
 
 ---
 

@@ -1,79 +1,75 @@
-"""Tests for market data source factory."""
+"""Settings parsing and source selection."""
 
-import os
-from unittest.mock import patch
+import pytest
 
 from app.market.cache import PriceCache
-from app.market.factory import create_market_data_source
-from app.market.massive_client import MassiveDataSource
-from app.market.simulator import SimulatorDataSource
+from app.market.factory import MarketSettings, create_market_data_source
+from app.market.simulator import SimulatorSource
+from app.market.yfinance_source import YFinanceSource
 
 
-class TestFactory:
-    """Tests for create_market_data_source factory."""
+def test_defaults():
+    s = MarketSettings.from_env({})
+    assert s == MarketSettings()
+    assert (s.use_yfinance, s.sim_time_scale, s.sim_update_interval, s.sim_event_rate) == (
+        False,
+        200.0,
+        0.5,
+        0.1,
+    )
+    assert s.sim_seed is None
 
-    def test_creates_simulator_when_no_api_key(self):
-        """Test that simulator is created when MASSIVE_API_KEY is not set."""
-        cache = PriceCache()
 
-        with patch.dict(os.environ, {}, clear=True):
-            source = create_market_data_source(cache)
+@pytest.mark.parametrize("val", ["true", "TRUE", " 1 ", "yes", "on"])
+def test_use_yfinance_truthy(val):
+    assert MarketSettings.from_env({"USE_YFINANCE": val}).use_yfinance
 
-        assert isinstance(source, SimulatorDataSource)
 
-    def test_creates_simulator_when_api_key_empty(self):
-        """Test that simulator is created when MASSIVE_API_KEY is empty."""
-        cache = PriceCache()
+@pytest.mark.parametrize("val", ["false", "0", "", "nope"])
+def test_use_yfinance_falsy(val):
+    assert not MarketSettings.from_env({"USE_YFINANCE": val}).use_yfinance
 
-        with patch.dict(os.environ, {"MASSIVE_API_KEY": ""}, clear=True):
-            source = create_market_data_source(cache)
 
-        assert isinstance(source, SimulatorDataSource)
+def test_sim_overrides_and_invalid_values():
+    env = {
+        "SIM_SEED": "42",
+        "SIM_TIME_SCALE": "60",
+        "SIM_EVENT_RATE": "0",
+        "SIM_UPDATE_INTERVAL": "0.25",
+    }
+    s = MarketSettings.from_env(env)
+    assert (s.sim_seed, s.sim_time_scale, s.sim_event_rate, s.sim_update_interval) == (
+        42,
+        60.0,
+        0.0,
+        0.25,
+    )
+    bad = MarketSettings.from_env(
+        {
+            "SIM_SEED": "x",
+            "SIM_TIME_SCALE": "-1",
+            "SIM_EVENT_RATE": "-2",
+            "SIM_UPDATE_INTERVAL": "abc",
+            "YFINANCE_POLL_INTERVAL": "0",
+        }
+    )
+    assert bad.sim_seed is None
+    assert (bad.sim_time_scale, bad.sim_event_rate, bad.sim_update_interval) == (200.0, 0.1, 0.5)
+    assert bad.yfinance_poll_interval == 15.0
 
-    def test_creates_simulator_when_api_key_whitespace(self):
-        """Test that simulator is created when MASSIVE_API_KEY is whitespace."""
-        cache = PriceCache()
 
-        with patch.dict(os.environ, {"MASSIVE_API_KEY": "   "}, clear=True):
-            source = create_market_data_source(cache)
+def test_factory_selects_simulator_by_default():
+    src = create_market_data_source(PriceCache(), MarketSettings())
+    assert isinstance(src, SimulatorSource) and src.name == "simulator"
 
-        assert isinstance(source, SimulatorDataSource)
 
-    def test_creates_massive_when_api_key_set(self):
-        """Test that Massive client is created when MASSIVE_API_KEY is set."""
-        cache = PriceCache()
+def test_factory_selects_yfinance():
+    src = create_market_data_source(PriceCache(), MarketSettings(use_yfinance=True))
+    assert isinstance(src, YFinanceSource) and src.name == "yfinance"
 
-        with patch.dict(os.environ, {"MASSIVE_API_KEY": "test-key"}, clear=True):
-            source = create_market_data_source(cache)
 
-        assert isinstance(source, MassiveDataSource)
-
-    def test_massive_receives_api_key(self):
-        """Test that Massive client receives the API key."""
-        cache = PriceCache()
-
-        with patch.dict(os.environ, {"MASSIVE_API_KEY": "test-key-123"}, clear=True):
-            source = create_market_data_source(cache)
-
-        assert isinstance(source, MassiveDataSource)
-        assert source._api_key == "test-key-123"
-
-    def test_simulator_receives_cache(self):
-        """Test that simulator receives the cache reference."""
-        cache = PriceCache()
-
-        with patch.dict(os.environ, {}, clear=True):
-            source = create_market_data_source(cache)
-
-        assert isinstance(source, SimulatorDataSource)
-        assert source._cache is cache
-
-    def test_massive_receives_cache(self):
-        """Test that Massive client receives the cache reference."""
-        cache = PriceCache()
-
-        with patch.dict(os.environ, {"MASSIVE_API_KEY": "test-key"}, clear=True):
-            source = create_market_data_source(cache)
-
-        assert isinstance(source, MassiveDataSource)
-        assert source._cache is cache
+def test_factory_reads_os_environ(monkeypatch):
+    monkeypatch.setenv("USE_YFINANCE", "true")
+    assert isinstance(create_market_data_source(PriceCache()), YFinanceSource)
+    monkeypatch.setenv("USE_YFINANCE", "false")
+    assert isinstance(create_market_data_source(PriceCache()), SimulatorSource)

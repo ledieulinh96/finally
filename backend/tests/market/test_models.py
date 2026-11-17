@@ -1,77 +1,46 @@
-"""Tests for PriceUpdate dataclass."""
+"""PriceQuote semantics and the PLAN §6 SSE payload shape."""
 
-import pytest
+from datetime import UTC, datetime
 
-from app.market.models import PriceUpdate
+from app.market.models import PriceQuote
+
+TS = datetime(2026, 11, 13, 9, 30, 1, 234000, tzinfo=UTC)
 
 
-class TestPriceUpdate:
-    """Unit tests for the PriceUpdate model."""
+def quote(price=75_400, prev=75_200, open_=74_800):
+    return PriceQuote("005930", price, prev, open_, TS, 7)
 
-    def test_price_update_creation(self):
-        """Test basic PriceUpdate creation."""
-        update = PriceUpdate(ticker="AAPL", price=190.50, previous_price=190.00, timestamp=1234567890.0)
-        assert update.ticker == "AAPL"
-        assert update.price == 190.50
-        assert update.previous_price == 190.00
-        assert update.timestamp == 1234567890.0
 
-    def test_change_calculation(self):
-        """Test price change calculation."""
-        update = PriceUpdate(ticker="AAPL", price=190.50, previous_price=190.00, timestamp=1234567890.0)
-        assert update.change == 0.50
+def test_direction():
+    assert quote(75_400, 75_200).direction == "up"
+    assert quote(75_000, 75_200).direction == "down"
+    assert quote(75_200, 75_200).direction == "flat"
 
-    def test_change_negative(self):
-        """Test negative price change."""
-        update = PriceUpdate(ticker="AAPL", price=189.50, previous_price=190.00, timestamp=1234567890.0)
-        assert update.change == -0.50
 
-    def test_change_percent_up(self):
-        """Test percentage change calculation (up)."""
-        update = PriceUpdate(ticker="AAPL", price=190.00, previous_price=100.00, timestamp=1234567890.0)
-        assert update.change_percent == 90.0
+def test_change_and_session_change_pct():
+    q = quote()
+    assert q.change == 200
+    assert q.session_change_pct == 0.80
+    assert quote(open_=0).session_change_pct == 0.0
 
-    def test_change_percent_down(self):
-        """Test percentage change calculation (down)."""
-        update = PriceUpdate(ticker="AAPL", price=100.00, previous_price=200.00, timestamp=1234567890.0)
-        assert update.change_percent == -50.0
 
-    def test_change_percent_zero_previous(self):
-        """Test percentage change with zero previous price."""
-        update = PriceUpdate(ticker="AAPL", price=100.00, previous_price=0.00, timestamp=1234567890.0)
-        assert update.change_percent == 0.0
+def test_to_event_matches_plan_shape_exactly():
+    assert quote().to_event("Samsung Electronics") == {
+        "ticker": "005930",
+        "name": "Samsung Electronics",
+        "price": 75400,
+        "prev_price": 75200,
+        "session_open": 74800,
+        "session_change_pct": 0.80,
+        "direction": "up",
+        "timestamp": "2026-11-13T09:30:01.234Z",
+    }
 
-    def test_direction_up(self):
-        """Test direction calculation (up)."""
-        update = PriceUpdate(ticker="AAPL", price=191.00, previous_price=190.00, timestamp=1234567890.0)
-        assert update.direction == "up"
 
-    def test_direction_down(self):
-        """Test direction calculation (down)."""
-        update = PriceUpdate(ticker="AAPL", price=189.00, previous_price=190.00, timestamp=1234567890.0)
-        assert update.direction == "down"
-
-    def test_direction_flat(self):
-        """Test direction calculation (flat)."""
-        update = PriceUpdate(ticker="AAPL", price=190.00, previous_price=190.00, timestamp=1234567890.0)
-        assert update.direction == "flat"
-
-    def test_to_dict(self):
-        """Test serialization to dictionary."""
-        update = PriceUpdate(ticker="AAPL", price=190.50, previous_price=190.00, timestamp=1234567890.0)
-        result = update.to_dict()
-
-        assert result["ticker"] == "AAPL"
-        assert result["price"] == 190.50
-        assert result["previous_price"] == 190.00
-        assert result["timestamp"] == 1234567890.0
-        assert result["change"] == 0.50
-        assert result["change_percent"] == 0.2632  # (0.50 / 190.00) * 100
-        assert result["direction"] == "up"
-
-    def test_immutability(self):
-        """Test that PriceUpdate is immutable."""
-        update = PriceUpdate(ticker="AAPL", price=190.50, previous_price=190.00, timestamp=1234567890.0)
-
-        with pytest.raises(AttributeError):
-            update.price = 200.00  # Should raise error
+def test_quote_is_immutable():
+    q = quote()
+    try:
+        q.price = 1  # type: ignore[misc]
+    except AttributeError:
+        return
+    raise AssertionError("PriceQuote should be frozen")

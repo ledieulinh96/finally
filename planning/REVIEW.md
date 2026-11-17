@@ -252,3 +252,52 @@ The following issues are most likely to cause implementation failures or agent-t
 8. **Single LLM mock fixture** — add a second fixture with a trade to enable E2E coverage of auto-execution.
 9. **`/api/chat` request/response schema** — define it explicitly in Section 8.
 10. **uvicorn worker count** — explicitly state `--workers 1` in the Dockerfile CMD.
+
+---
+
+## Resolution (2026-11-17)
+
+Every finding above is now either **implemented in code** (market data, `backend/app/market/`) or **decided in `PLAN.md`** for the agents who build the remaining platform.
+
+### Implemented in the market data backend
+
+| Finding | Resolution |
+|---|---|
+| SSE pushes stale prices 30× between yfinance polls | Sources write to the cache only when the price changes. SSE sends only changed tickers (per-ticker events, `id` = cache version). A `: keepalive` comment goes out after 15 s idle. |
+| Empty cache on first SSE connect / first yfinance poll fails silently | `start()` and `add_ticker()` write a first price before returning. SSE sends a full snapshot on connect. A failed first poll is retried with back-off. |
+| Health check doesn't reflect yfinance state | `GET /api/health` returns `market_data` (`ok` / `degraded` / `stopped`), `source` and `market_session`. `degraded` is set after 3 consecutive poll failures. |
+| yfinance unstable / rate-limited, no back-off | One batched download per cycle, run in a worker thread. Every exception is caught. Exponential back-off runs from 15 s to 5 min. NaN or missing symbols keep their last price. |
+| `.KS`/`.KQ` suffix guessing & latency (Q1) | The bundled `backend/schema/krx_listing.csv` resolves the suffix without network calls. Only unlisted tickers are probed (`.KS`, then `.KQ`). Successful resolutions are memoized. |
+| `shortName` is Korean or terse | Names come from the listing first, then OpenDART, then `shortName`, then the ticker code, via `NameRegistry`. The SSE payload is UTF-8 (`ensure_ascii=False`). |
+| Position name missing after its watchlist row is removed | `NameRegistry` is independent of the watchlist table. `TickerTracker` keeps held tickers priced (tracked = watchlist ∪ positions). |
+| `session_open` semantics in yfinance mode | The first price seen after server start, the same as in the simulator. Documented in PLAN §6. |
+| KRX market hours: frozen prices look broken | `market_session()` (KST) is exposed in health. PLAN tells the frontend to show a "Market closed" badge in yfinance mode. The simulator runs 24/7 by design. |
+| Ticker validation unspecified | `normalize_ticker()`: `^[0-9A-Z]{6}$`; strips `.KS`/`.KQ`; string-only. |
+| Trades when the cache has no price | Sources never write 0 or non-int prices (the cache rejects them). PLAN requires a "No price available" rejection. |
+| Missing SSE tests, thread-safety test, full-universe test | `test_stream.py` covers the generator and a raw ASGI endpoint with disconnect. There is an 8-thread cache test. A conformance suite runs both sources on all 10 default tickers. |
+| uvicorn `--workers N` would split the cache | `app/main.py`, PLAN §3 and §11, and the backend docs all require `--workers 1`. |
+| Seed prices are stale | Documented in PLAN §7, with live yfinance figures from 2026-11-17. The seeds only drive the simulator. |
+
+### Decided in PLAN.md (for the remaining agents)
+
+| # | Finding | Decision (PLAN section) |
+|---|---|---|
+| 1 | `backend/db` vs `backend/schema` | `backend/schema/` everywhere (§4). The folder now holds `krx_listing.csv`. |
+| 2 | `POST /api/watchlist` `name` | Optional; the backend resolves it. Status codes 201, 409 (duplicate), 404 (unknown ticker) and 422 (§8). |
+| 3 | `GET /api/portfolio/history` write side-effect | GET is read-only. Snapshots are taken after each trade plus every 60 s in the background (§7). |
+| 4 | SQLite WAL | `journal_mode=WAL` and `busy_timeout=5000`. Each trade runs in one `BEGIN IMMEDIATE` transaction (§7). |
+| 5 | `session_open` in yfinance mode | First price seen; documented (§6). |
+| 6 | KRX market hours | `market_session` in health; "Market closed" badge (§6, §8). |
+| 7 | Q2 fractional shares | Whole shares only; validated as a positive int (§13). |
+| 8 | Single LLM mock fixture | A second "buy" fixture with a trade and a watchlist add, plus an E2E scenario (§9, §12). |
+| 9 | `/api/chat` schema | Request and response defined; `actions` JSON shape defined (§7, §8). |
+| 10 | uvicorn worker count | `--workers 1` (§3, §11). |
+| — | Indexes, `portfolio_state` PK, idempotent seeding | Added (§7). |
+| — | Error shape, duplicate/404 behaviour, trade validation, empty-cache fallback | "Validation & Error Conventions" (§8). |
+| — | Malformed LLM output, `name` omitted on add, history off-by-one, message length | §9 and §8. |
+| — | OpenDART scope (Q3) and trigger | Profile and key financials, keyword heuristic, 24 h cache (§9, §13). |
+| — | Playwright version, Compose only in `test/` | Pinned image; no top-level compose (§4, §12). |
+
+**Not adopted:**
+- *Remove OpenDART for v1*: kept, but optional and narrowly scoped (Q3).
+- *Drop `session_open` / the `name` column*: kept. PLAN's payload already depends on them, and they are now well-defined.
