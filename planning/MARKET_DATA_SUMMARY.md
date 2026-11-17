@@ -3,7 +3,6 @@
 **Status:** Implemented for KOSPI/KOSDAQ (integer KRW) in `backend/app/market/`; 90 unit tests passing, ruff clean, 95% coverage.
 
 Design sources: `MARKET_DATA_INTERFACE.md` (interface, cache, SSE, tracker), `MARKET_SIMULATOR.md` (model), `MARKET_DATA_SOURCES.md` (yfinance, listing).
-`MARKET_DATA_DESIGN.md` and `planning/archive/*` describe the earlier US-stock/Massive build and are **obsolete**.
 
 | Module | Purpose |
 |---|---|
@@ -19,4 +18,4 @@ Design sources: `MARKET_DATA_INTERFACE.md` (interface, cache, SSE, tracker), `MA
 | `stream.py` | SSE `GET /api/stream/prices`: per-ticker events, `id:`/`Last-Event-ID`, keepalive |
 | `tracker.py` | `TickerTracker`: tracked = watchlist ∪ positions; `price_for_trade()` |
 
-Not done (belongs to the rest of the platform): FastAPI `main.py`/lifespan wiring, DB-backed watchlist/positions callables, OpenDART name lookup.
+Not done (belongs to the rest of the platform): FastAPI `main.py`/lifespan wiring, `GET /api/health` (incl. `market_session` KST clock), DB-backed watchlist/positions callables, OpenDART name lookup, running with `--workers 1`.
