@@ -2,48 +2,47 @@
 
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Literal
+
+Direction = Literal["up", "down", "flat"]
 
 
 @dataclass(frozen=True, slots=True)
-class PriceUpdate:
-    """Immutable snapshot of a single ticker's price at a point in time."""
+class PriceQuote:
+    """Immutable latest price for one ticker. Prices are integer KRW."""
 
-    ticker: str
-    price: float
-    previous_price: float
-    timestamp: float = field(default_factory=time.time)  # Unix seconds
-
-    @property
-    def change(self) -> float:
-        """Absolute price change from previous update."""
-        return round(self.price - self.previous_price, 4)
+    ticker: str  # 6-char KRX code, e.g. "005930" — always str
+    price: int
+    prev_price: int  # price before this update
+    session_open: int  # first price seen this server session
+    timestamp: datetime  # tz-aware UTC
+    version: int  # cache version at which this quote was written
 
     @property
-    def change_percent(self) -> float:
-        """Percentage change from previous update."""
-        if self.previous_price == 0:
-            return 0.0
-        return round((self.price - self.previous_price) / self.previous_price * 100, 4)
-
-    @property
-    def direction(self) -> str:
-        """'up', 'down', or 'flat'."""
-        if self.price > self.previous_price:
+    def direction(self) -> Direction:
+        if self.price > self.prev_price:
             return "up"
-        elif self.price < self.previous_price:
+        if self.price < self.prev_price:
             return "down"
         return "flat"
 
-    def to_dict(self) -> dict:
-        """Serialize for JSON / SSE transmission."""
+    @property
+    def session_change_pct(self) -> float:
+        if self.session_open == 0:
+            return 0.0
+        return round((self.price - self.session_open) / self.session_open * 100, 2)
+
+    def to_event(self, name: str) -> dict:
+        """Exact SSE payload shape from PLAN.md section 6."""
         return {
             "ticker": self.ticker,
+            "name": name,
             "price": self.price,
-            "previous_price": self.previous_price,
-            "timestamp": self.timestamp,
-            "change": self.change,
-            "change_percent": self.change_percent,
+            "prev_price": self.prev_price,
+            "session_open": self.session_open,
+            "session_change_pct": self.session_change_pct,
             "direction": self.direction,
+            "timestamp": self.timestamp.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         }

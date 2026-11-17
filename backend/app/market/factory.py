@@ -1,31 +1,42 @@
-"""Factory for creating market data sources."""
+"""Select the market data source from environment configuration."""
 
 from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 
+from .base import MarketDataSource
 from .cache import PriceCache
-from .interface import MarketDataSource
-from .massive_client import MassiveDataSource
-from .simulator import SimulatorDataSource
 
 logger = logging.getLogger(__name__)
 
 
-def create_market_data_source(price_cache: PriceCache) -> MarketDataSource:
-    """Create the appropriate market data source based on environment variables.
+def _float(env: Mapping[str, str], key: str, default: float) -> float:
+    try:
+        return float(env[key]) if env.get(key, "").strip() else default
+    except ValueError:
+        logger.warning("Invalid %s=%r, using %s", key, env[key], default)
+        return default
 
-    - MASSIVE_API_KEY set and non-empty → MassiveDataSource (real market data)
-    - Otherwise → SimulatorDataSource (GBM simulation)
 
-    Returns an unstarted source. Caller must await source.start(tickers).
-    """
-    api_key = os.environ.get("MASSIVE_API_KEY", "").strip()
+def create_source(cache: PriceCache, env: Mapping[str, str] | None = None) -> MarketDataSource:
+    """USE_YFINANCE=true -> YFinanceSource, otherwise SimulatorSource. Returns an unstarted source."""
+    env = os.environ if env is None else env
+    if env.get("USE_YFINANCE", "").strip().lower() == "true":
+        from .yfinance_source import YFinanceSource
 
-    if api_key:
-        logger.info("Market data source: Massive API (real data)")
-        return MassiveDataSource(api_key=api_key, price_cache=price_cache)
-    else:
-        logger.info("Market data source: GBM Simulator")
-        return SimulatorDataSource(price_cache=price_cache)
+        logger.info("Market data source: yfinance")
+        return YFinanceSource(cache, poll_interval=15.0)
+
+    from .simulator import SimulatorSource
+
+    seed_raw = env.get("SIM_SEED", "").strip()
+    logger.info("Market data source: simulator")
+    return SimulatorSource(
+        cache,
+        update_interval=_float(env, "SIM_UPDATE_INTERVAL", 0.5),
+        time_scale=_float(env, "SIM_TIME_SCALE", 200.0),
+        seed=int(seed_raw) if seed_raw.lstrip("-").isdigit() else None,
+        event_rate_per_min=_float(env, "SIM_EVENT_RATE", 0.1),
+    )
