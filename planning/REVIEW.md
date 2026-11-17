@@ -278,6 +278,8 @@ Every finding above is now either **implemented in code** (market data, `backend
 | uvicorn `--workers N` would split the cache | `app/main.py`, PLAN §3 and §11, and the backend docs all require `--workers 1`. |
 | Seed prices are stale | Documented in PLAN §7, with live yfinance figures from 2026-11-17. The seeds only drive the simulator. |
 
+**Still open for the backend agent:** OpenDART name lookup; reading watchlist ∪ positions from the DB in the lifespan (it currently starts with `DEFAULT_TICKERS`).
+
 ### Decided in PLAN.md (for the remaining agents)
 
 | # | Finding | Decision (PLAN section) |
