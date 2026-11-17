@@ -3,8 +3,6 @@
 **Status:** Complete for KRX (KOSPI/KOSDAQ). Tested: 147 tests passing, 98% line coverage, ruff clean.
 **Date:** 2026-11-17 · Designs: [`MARKET_DATA_INTERFACE.md`](MARKET_DATA_INTERFACE.md), [`MARKET_SIMULATOR.md`](MARKET_SIMULATOR.md), [`MARKET_DATA_SOURCES.md`](MARKET_DATA_SOURCES.md)
 
-The earlier US-market version (Massive/Polygon, AAPL…) is superseded. Its design docs (`MARKET_DATA_DESIGN.md`, `planning/archive/`) are kept for history only and are **obsolete**.
-
 ## Architecture
 
 ```
@@ -116,9 +114,10 @@ await TickerTracker(source).sync(watchlist, positions)   # after watchlist chang
 names.get("005930")                        # "Samsung Electronics"
 ```
 
-## Review items addressed
+## Still open (for the backend agent)
 
-See the "Resolution" section of [`REVIEW.md`](REVIEW.md).
+- OpenDART name lookup (the `NameRegistry` fallback chain currently skips it).
+- Read watchlist ∪ positions from the DB in the lifespan (it currently starts with `DEFAULT_TICKERS`).
 
 ## Demo
 
