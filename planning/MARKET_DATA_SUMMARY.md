@@ -122,5 +122,5 @@ names.get("005930")                        # "Samsung Electronics"
 ## Demo
 
 ```bash
-cd backend && uv run market_data_demo.py   # 60 s Rich dashboard: ₩ prices, names, sparklines, jump events
+cd backend && uv run market_data_demo.py   # 30 s plain-terminal view: ₩ prices, red/green moves, sparklines, jumps, PASS/FAIL checks (-d, --seed, --plain)
 ```
