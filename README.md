@@ -26,25 +26,32 @@ Single Docker container serving everything on port 8000:
 
 ## Quick Start
 
+Prerequisite: Docker (Docker Desktop on macOS/Windows).
+
 ```bash
 # Configure
 cp .env.example .env
-# Add your OPENROUTER_API_KEY to .env
+# Add your OPENROUTER_API_KEY to .env (without it the app runs, but AI chat fails;
+# set LLM_MOCK=true for canned chat replies)
 
 # Run (macOS/Linux)
-./scripts/start_mac.sh          # add --build to force a rebuild
-./scripts/stop_mac.sh           # data persists in the finally-data volume
+./scripts/start_mac.sh            # builds the image on first run, then opens http://localhost:8000
+./scripts/start_mac.sh --build    # force a rebuild (after pulling changes)
+./scripts/start_mac.sh --no-open  # don't open the browser
+./scripts/stop_mac.sh             # stops the container; data persists in the finally-data volume
 
 # Run (Windows PowerShell)
-./scripts/start_windows.ps1
-./scripts/stop_windows.ps1
+.\scripts\start_windows.ps1         # -Build to force a rebuild, -NoOpen to skip the browser
+.\scripts\stop_windows.ps1
 
 # Or with plain Docker
 docker build -t finally .
-docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
-
-# Open http://localhost:8000
+docker run -d --name finally -v finally-data:/app/db -p 8000:8000 --env-file .env finally
 ```
+
+Open http://localhost:8000. The scripts are idempotent: re-running start on a running container just prints the URL.
+Set `FINALLY_PORT=8080` to publish on a different host port. Logs: `docker logs -f finally`.
+To reset all data (cash, positions, watchlist): `./scripts/stop_mac.sh && docker volume rm finally-data`.
 
 ## Environment Variables
 

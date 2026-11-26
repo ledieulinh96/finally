@@ -348,6 +348,7 @@ Seed prices are illustrative and drift from reality (a live yfinance check on 20
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/api/chat` | Send a message, receive complete JSON response (message + executed actions) |
+| GET | `/api/chat/history` | Stored conversation, oldest first (last 50): `[{id, role, content, trades, watchlist_changes, created_at}]` — lets the chat panel survive a page reload |
 
 ### System
 | Method | Path | Description |

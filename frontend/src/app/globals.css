@@ -1,0 +1,52 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@400;500;600&family=IBM+Plex+Sans+KR:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background: #0e1320;
+  color: #dbe1ec;
+}
+
+body {
+  font-family: "IBM Plex Sans", "IBM Plex Sans KR", system-ui, sans-serif;
+  font-feature-settings: "tnum" 1;
+  -webkit-font-smoothing: antialiased;
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Price flash: background lights instantly, then fades out over ~500ms. */
+@keyframes flash-up {
+  from { background-color: rgba(47, 191, 113, 0.32); }
+  to { background-color: rgba(47, 191, 113, 0); }
+}
+@keyframes flash-down {
+  from { background-color: rgba(229, 72, 77, 0.32); }
+  to { background-color: rgba(229, 72, 77, 0); }
+}
+.flash-up { animation: flash-up 500ms ease-out; }
+.flash-down { animation: flash-down 500ms ease-out; }
+
+:focus-visible {
+  outline: 2px solid #ecad0a;
+  outline-offset: 1px;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #273049 transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .flash-up, .flash-down { animation-duration: 1ms; }
+  * { transition-duration: 1ms !important; }
+}

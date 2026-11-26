@@ -213,3 +213,21 @@ db/*.db
 db/*.db-journal
 db/*.db-wal
 db/*.db-shm
+!db/.gitkeep
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+backend/static/
+node_modules/
+
+# Playwright / E2E artifacts
+test-results/
+playwright-report/
+test/test-results/
+test/playwright-report/
+blob-report/
+
+# Playwright MCP browser artifacts
+.playwright-mcp/

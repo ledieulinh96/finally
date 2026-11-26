@@ -1,0 +1,47 @@
+# E2E test stack: app (built from repo-root Dockerfile) + pinned Playwright runner.
+# Run from repo root:
+#   docker compose -f test/docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from playwright
+#   docker compose -f test/docker-compose.test.yml down -v
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      LLM_MOCK: "true"
+      SIM_SEED: "42"
+      USE_YFINANCE: "false"
+      OPENDART_API_KEY: ""
+      DB_PATH: /app/db/finally.db
+    # Fresh, throwaway DB for every run.
+    tmpfs:
+      - /app/db
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health', timeout=3).status == 200 else 1)"
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 5s
+
+  playwright:
+    image: mcr.microsoft.com/playwright:v1.56.0-noble
+    depends_on:
+      app:
+        condition: service_healthy
+    working_dir: /work
+    environment:
+      BASE_URL: http://app:8000
+      CI: "true"
+    volumes:
+      - ./:/work
+      # Keep container node_modules separate from any host install (different OS/arch).
+      - e2e-node-modules:/work/node_modules
+    ipc: host
+    command: ["bash", "-lc", "npm install --no-audit --no-fund && npx playwright test"]
+
+volumes:
+  e2e-node-modules:
