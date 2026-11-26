@@ -1,22 +1,3 @@
 {
-  "enabledPlugins": {
-    "frontend-design@claude-plugins-official": true,
-    "context7@claude-plugins-official": true,
-    "playwright@claude-plugins-official": true
-  },
-  "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/scripts/gemini_change_review.sh",
-            "async": true,
-            "timeout": 900,
-            "statusMessage": "Gemini reviewing uncommitted changes..."
-          }
-        ]
-      }
-    ]
-  }
+  "enabledPlugins": {}
 }
